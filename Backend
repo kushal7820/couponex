@@ -1,0 +1,1611 @@
+const { validationResult } = require('express-validator');
+const Coupon = require('../models/Coupon');
+const { encryptCoupon, maskCode } = require('../utils/encryption');
+const { scoreCoupon } = require('../services/ai');
+const logger = require('../utils/logger');
+
+exports.list = async (req, res) => {
+  try {
+    const { category, sort = '-createdAt', page = 1, limit = 20, q } = req.query;
+    const filter = { status: 'active', expiryDate: { $gt: new Date() } };
+    if (category) filter.category = category;
+    if (q) filter.$text = { $search: q };
+
+    const skip = (Number(page) - 1) * Number(limit);
+    const [docs, total] = await Promise.all([
+      Coupon.find(filter)
+        .select('-encryptedCode -otp')
+        .populate('seller', 'name trustScore successfulTransactions')
+        .sort(sort).skip(skip).limit(Number(limit)).lean(),
+      Coupon.countDocuments(filter)
+    ]);
+
+    res.json({ success: true, data: docs, total, page: Number(page), pages: Math.ceil(total / Number(limit)) });
+  } catch (err) {
+    logger.error('Coupon list error', { err: err.message });
+    res.status(500).json({ success: false, message: 'Failed to fetch coupons.' });
+  }
+};
+
+exports.get = async (req, res) => {
+  try {
+    const doc = await Coupon.findById(req.params.id)
+      .select('-encryptedCode -otp')
+      .populate('seller', 'name trustScore totalTransactions');
+    if (!doc) return res.status(404).json({ success: false, message: 'Coupon not found.' });
+    await Coupon.findByIdAndUpdate(req.params.id, { $inc: { views: 1 } });
+    res.json({ success: true, data: doc });
+  } catch {
+    res.status(500).json({ success: false, message: 'Failed to fetch coupon.' });
+  }
+};
+
+exports.create = async (req, res) => {
+  const errs = validationResult(req);
+  if (!errs.isEmpty()) return res.status(400).json({ success: false, errors: errs.array() });
+
+  try {
+    const { brand, category, description, couponCode, faceValue, salePrice, minOrder, expiryDate, terms, applicableOn } = req.body;
+
+    if (Number(salePrice) >= Number(faceValue))
+      return res.status(400).json({ success: false, message: 'Sale price must be less than face value.' });
+
+    const daysLeft = Math.ceil((new Date(expiryDate) - Date.now()) / 86400000);
+    if (daysLeft < 3)
+      return res.status(400).json({ success: false, message: 'Coupon must have at least 3 days until expiry.' });
+
+    const encryptedCode = encryptCoupon(couponCode.trim());
+    const maskedCode    = maskCode(couponCode.trim());
+
+    const coupon = await Coupon.create({
+      seller: req.user._id,
+      brand, category, description, encryptedCode, maskedCode,
+      faceValue: Number(faceValue), salePrice: Number(salePrice),
+      minOrder: Number(minOrder) || 0, expiryDate: new Date(expiryDate),
+      terms, applicableOn, status: 'pending_review'
+    });
+
+    // AI scoring in background
+    scoreCoupon({ brand, category, description, faceValue, salePrice, minOrder, expiryDate })
+      .then(ai => Coupon.findByIdAndUpdate(coupon._id, {
+        'ai.score': ai.score, 'ai.rating': ai.rating,
+        'ai.fraudRisk': ai.fraudRisk, 'ai.flags': ai.flags || [],
+        'ai.scoredAt': new Date(),
+        status: ai.fraudRisk === 'high' ? 'flagged' : 'active'
+      }))
+      .catch(err => {
+        logger.warn('AI scoring failed for coupon', { id: coupon._id, err: err.message });
+        Coupon.findByIdAndUpdate(coupon._id, { status: 'active', 'ai.rating': 'unrated' });
+      });
+
+    logger.info('Coupon listed', { id: coupon._id, brand, seller: req.user.email });
+    res.status(201).json({
+      success: true, message: 'Coupon listed! AI validation in progress.',
+      data: { id: coupon._id, brand, maskedCode, salePrice: coupon.salePrice, status: coupon.status }
+    });
+  } catch (err) {
+    logger.error('Coupon create error', { err: err.message });
+    res.status(500).json({ success: false, message: 'Failed to list coupon.' });
+  }
+};
+
+exports.myListings = async (req, res) => {
+  try {
+    const docs = await Coupon.find({ seller: req.user._id }).select('-encryptedCode -otp').sort('-createdAt');
+    res.json({ success: true, data: docs });
+  } catch {
+    res.status(500).json({ success: false, message: 'Failed to fetch listings.' });
+  }
+};
+
+exports.remove = async (req, res) => {
+  try {
+    const coupon = await Coupon.findById(req.params.id);
+    if (!coupon) return res.status(404).json({ success: false, message: 'Not found.' });
+    if (String(coupon.seller) !== String(req.user._id) && req.user.role !== 'admin')
+      return res.status(403).json({ success: false, message: 'Not authorized.' });
+    if (['sold','reserved'].includes(coupon.status))
+      return res.status(400).json({ success: false, message: 'Cannot remove this coupon.' });
+    await coupon.deleteOne();
+    res.json({ success: true, message: 'Coupon removed.' });
+  } catch {
+    res.status(500).json({ success: false, message: 'Failed to remove coupon.' });
+  }
+};
+
+const Transaction = require('../models/Transaction');
+const Coupon      = require('../models/Coupon');
+const escrow      = require('../services/escrow');
+const juspay      = require('../services/juspay');
+const { verifyHmac } = require('../utils/encryption');
+const logger      = require('../utils/logger');
+
+/* POST /api/payments/initiate */
+exports.initiate = async (req, res) => {
+  try {
+    const { couponId } = req.body;
+    if (!couponId) return res.status(400).json({ success: false, message: 'couponId required.' });
+
+    const result = await escrow.initiate({ couponId, buyerId: req.user._id });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    logger.error('Payment initiate error', { err: err.message });
+    res.status(400).json({ success: false, message: err.message });
+  }
+};
+
+/* POST /api/payments/webhook  — called by JusPay */
+exports.webhook = async (req, res) => {
+  try {
+    // Body is raw buffer for signature verification
+    const raw  = req.body.toString();
+    const sig  = req.headers['x-jp-signature'] || '';
+    const secret = process.env.JUSPAY_WEBHOOK_SECRET || '';
+
+    if (secret && !verifyHmac(raw, sig, secret)) {
+      logger.warn('Invalid JusPay webhook signature');
+      return res.status(401).json({ success: false, message: 'Bad signature.' });
+    }
+
+    const payload = JSON.parse(raw);
+    const { event_name, content } = payload;
+    logger.info('JusPay webhook', { event: event_name, order: content?.order?.order_id });
+
+    if (['ORDER_SUCCEEDED', 'PAYMENT_AUTHORIZED', 'TRANSACTION_CREATED'].includes(event_name)) {
+      const order = content.order;
+      if (juspay.mapStatus(order.status) === 'captured') {
+        await escrow.onPaymentSuccess({ orderId: order.order_id, paymentId: order.txn_id, raw: order });
+      }
+    } else if (['ORDER_FAILED', 'PAYMENT_DECLINED'].includes(event_name)) {
+      const order = content.order;
+      const txn   = await Transaction.findOne({ 'payment.orderId': order.order_id });
+      if (txn && txn.status === 'payment_pending') {
+        await Coupon.findByIdAndUpdate(txn.coupon, { status: 'active' });
+        txn.payment.status = 'failed';
+        txn.status = 'failed';
+        txn.notes.push({ msg: `Payment failed: ${order.error_message || 'Unknown'}` });
+        await txn.save();
+      }
+    }
+
+    res.json({ success: true }); // Always 200 to JusPay
+  } catch (err) {
+    logger.error('Webhook error', { err: err.message });
+    res.json({ success: true }); // Still 200 to prevent retries
+  }
+};
+
+/* POST /api/payments/verify-otp */
+exports.verifyOTP = async (req, res) => {
+  try {
+    const { txnId, otp } = req.body;
+    if (!txnId || !otp) return res.status(400).json({ success: false, message: 'txnId and otp required.' });
+
+    const result = await escrow.verifyOTP({ txnId, buyerId: req.user._id, otp: String(otp).trim() });
+    res.json({ success: true, data: result });
+  } catch (err) {
+    logger.error('OTP verify error', { err: err.message });
+    res.status(400).json({ success: false, message: err.message });
+  }
+};
+
+/* GET /api/payments/status/:txnId */
+exports.status = async (req, res) => {
+  try {
+    const txn = await Transaction.findOne({ txnId: req.params.txnId, buyer: req.user._id })
+      .populate('coupon', 'brand description maskedCode faceValue expiryDate category');
+    if (!txn) return res.status(404).json({ success: false, message: 'Transaction not found.' });
+
+    res.json({ success: true, data: {
+      txnId:          txn.txnId,
+      status:         txn.status,
+      escrowStatus:   txn.escrow.status,
+      validationStatus: txn.validation.status,
+      amount:         txn.amount,
+      paymentStatus:  txn.payment.status,
+      coupon:         txn.coupon,
+      completedAt:    txn.completedAt,
+      createdAt:      txn.createdAt
+    }});
+  } catch {
+    res.status(500).json({ success: false, message: 'Failed to fetch transaction.' });
+  }
+};
+
+/* GET /api/payments/history */
+exports.history = async (req, res) => {
+  try {
+    const docs = await Transaction.find({ buyer: req.user._id })
+      .populate('coupon', 'brand description maskedCode category')
+      .sort('-createdAt').limit(50);
+    res.json({ success: true, data: docs });
+  } catch {
+    res.status(500).json({ success: false, message: 'Failed to fetch history.' });
+  }
+};
+
+/* GET /api/payments/callback — JusPay redirect after payment */
+exports.callback = (req, res) => {
+  const { txn, order_id, status } = req.query;
+  const fe = process.env.FRONTEND_URL || 'http://localhost:3000';
+  const success = status === 'CHARGED';
+  res.redirect(`${fe}/payment/${success ? 'processing' : 'failed'}?txn=${txn}&order=${order_id}`);
+};
+
+const jwt  = require('jsonwebtoken');
+const { validationResult } = require('express-validator');
+const User = require('../models/User');
+const logger = require('../utils/logger');
+
+const sign = (id, secret, exp) => jwt.sign({ id }, secret, { expiresIn: exp });
+
+const tokens = (userId) => ({
+  accessToken:  sign(userId, process.env.JWT_SECRET,         process.env.JWT_EXPIRE || '7d'),
+  refreshToken: sign(userId, process.env.JWT_REFRESH_SECRET, process.env.JWT_REFRESH_EXPIRE || '30d')
+});
+
+const respond = async (user, code, res) => {
+  const { accessToken, refreshToken } = tokens(user._id);
+  await User.findByIdAndUpdate(user._id, { refreshToken, lastLogin: new Date() });
+  res.status(code).json({
+    success: true, accessToken, refreshToken,
+    user: { id: user._id, name: user.name, email: user.email, role: user.role, wallet: user.wallet, trustScore: user.trustScore }
+  });
+};
+
+exports.register = async (req, res) => {
+  const errs = validationResult(req);
+  if (!errs.isEmpty()) return res.status(400).json({ success: false, errors: errs.array() });
+
+  try {
+    const { name, email, password, phone, role } = req.body;
+    if (await User.findOne({ email }))
+      return res.status(409).json({ success: false, message: 'Email already registered.' });
+
+    const user = await User.create({ name, email, password, phone, role: ['buyer','seller'].includes(role) ? role : 'buyer' });
+    logger.info('User registered', { email, role: user.role });
+    respond(user, 201, res);
+  } catch (err) {
+    logger.error('Register error', { err: err.message });
+    res.status(500).json({ success: false, message: 'Registration failed.' });
+  }
+};
+
+exports.login = async (req, res) => {
+  const errs = validationResult(req);
+  if (!errs.isEmpty()) return res.status(400).json({ success: false, errors: errs.array() });
+
+  try {
+    const { email, password } = req.body;
+    const user = await User.findOne({ email }).select('+password');
+    if (!user) return res.status(401).json({ success: false, message: 'Invalid credentials.' });
+    if (user.isLocked()) return res.status(423).json({ success: false, message: 'Account locked. Try again later.' });
+
+    const ok = await user.matchPassword(password);
+    if (!ok) { await user.incAttempts(); return res.status(401).json({ success: false, message: 'Invalid credentials.' }); }
+    if (!user.isActive) return res.status(403).json({ success: false, message: 'Account deactivated.' });
+
+    if (user.loginAttempts) await User.findByIdAndUpdate(user._id, { $set: { loginAttempts: 0 }, $unset: { lockUntil: 1 } });
+    logger.info('User logged in', { email });
+    respond(user, 200, res);
+  } catch (err) {
+    logger.error('Login error', { err: err.message });
+    res.status(500).json({ success: false, message: 'Login failed.' });
+  }
+};
+
+exports.refresh = async (req, res) => {
+  try {
+    const { refreshToken } = req.body;
+    if (!refreshToken) return res.status(401).json({ success: false, message: 'Refresh token required.' });
+
+    const decoded = jwt.verify(refreshToken, process.env.JWT_REFRESH_SECRET);
+    const user = await User.findById(decoded.id).select('+refreshToken');
+    if (!user || user.refreshToken !== refreshToken)
+      return res.status(401).json({ success: false, message: 'Invalid refresh token.' });
+
+    const accessToken = sign(user._id, process.env.JWT_SECRET, process.env.JWT_EXPIRE || '7d');
+    res.json({ success: true, accessToken });
+  } catch {
+    res.status(401).json({ success: false, message: 'Refresh token expired.' });
+  }
+};
+
+exports.logout = async (req, res) => {
+  await User.findByIdAndUpdate(req.user._id, { $unset: { refreshToken: 1 } });
+  res.json({ success: true, message: 'Logged out.' });
+};
+
+exports.me = (req, res) => {
+  res.json({ success: true, user: req.user });
+};
+
+const { chat } = require('../services/ai');
+const logger = require('../utils/logger');
+
+exports.message = async (req, res) => {
+  try {
+    const { message, history } = req.body;
+    if (!message?.trim()) return res.status(400).json({ success: false, message: 'Message required.' });
+    if (message.length > 600) return res.status(400).json({ success: false, message: 'Message too long.' });
+
+    const ctx = req.user ? { name: req.user.name, role: req.user.role } : null;
+    const reply = await chat({ message: message.trim(), history: history || [], userCtx: ctx });
+
+    res.json({ success: true, data: { ...reply, timestamp: new Date() } });
+  } catch (err) {
+    logger.error('Chat error', { err: err.message });
+    res.status(500).json({ success: false, message: "I'm temporarily unavailable. Try again shortly." });
+  }
+};
+
+const mongoose = require('mongoose');
+const logger = require('../utils/logger');
+
+const connectDB = async () => {
+  try {
+    const conn = await mongoose.connect(process.env.MONGODB_URI, {
+      maxPoolSize: 10,
+      serverSelectionTimeoutMS: 5000,
+      socketTimeoutMS: 45000,
+    });
+    logger.info(`MongoDB connected: ${conn.connection.host}`);
+    mongoose.connection.on('disconnected', () => logger.warn('MongoDB disconnected'));
+    mongoose.connection.on('error', (err) => logger.error('MongoDB error', { err: err.message }));
+  } catch (err) {
+    logger.error('MongoDB connection failed', { err: err.message });
+    process.exit(1);
+  }
+};
+
+module.exports = connectDB;
+
+const rateLimit   = require('express-rate-limit');
+const helmet      = require('helmet');
+const mongoSanitize = require('express-mongo-sanitize');
+const hpp         = require('hpp');
+const xss         = require('xss');
+const logger      = require('../utils/logger');
+
+/* ── Helmet ────────────────────────────────────────────────── */
+const helmetMw = helmet({
+  contentSecurityPolicy: {
+    directives: {
+      defaultSrc:  ["'self'"],
+      scriptSrc:   ["'self'"],
+      styleSrc:    ["'self'", "'unsafe-inline'", "fonts.googleapis.com"],
+      fontSrc:     ["'self'", "fonts.gstatic.com"],
+      imgSrc:      ["'self'", "data:", "https:"],
+      connectSrc:  ["'self'", "https://sandbox.juspay.in", "https://api.anthropic.com"],
+      frameSrc:    ["'self'", "https://sandbox.juspay.in"]
+    }
+  },
+  crossOriginEmbedderPolicy: false
+});
+
+/* ── Rate Limiters ─────────────────────────────────────────── */
+const makeLimit = (windowMs, max, msg) => rateLimit({
+  windowMs, max, standardHeaders: true, legacyHeaders: false,
+  handler: (req, res) => {
+    logger.warn(`Rate limit hit: ${req.ip} → ${req.originalUrl}`);
+    res.status(429).json({ success: false, message: msg });
+  }
+});
+
+const globalLimit   = makeLimit(15 * 60 * 1000, 300, 'Too many requests. Please slow down.');
+const authLimit     = makeLimit(15 * 60 * 1000, 10,  'Too many login attempts. Try again in 15 min.');
+const paymentLimit  = makeLimit(60 * 60 * 1000, 20,  'Too many payment attempts. Try again later.');
+const chatLimit     = makeLimit(60 * 1000,       30,  'Too many messages. Please wait a moment.');
+const couponLimit   = makeLimit(60 * 60 * 1000, 15,  'Too many listings. Try again later.');
+
+/* ── XSS sanitizer ─────────────────────────────────────────── */
+const sanitizeXSS = (req, _, next) => {
+  const clean = (obj) => {
+    if (!obj || typeof obj !== 'object') return;
+    for (const k of Object.keys(obj)) {
+      if (typeof obj[k] === 'string') obj[k] = xss(obj[k]);
+      else if (typeof obj[k] === 'object') clean(obj[k]);
+    }
+  };
+  clean(req.body);
+  clean(req.query);
+  next();
+};
+
+/* ── Request logger ────────────────────────────────────────── */
+const reqLogger = (req, res, next) => {
+  const t = Date.now();
+  res.on('finish', () => {
+    const ms = Date.now() - t;
+    const lvl = res.statusCode >= 500 ? 'error' : res.statusCode >= 400 ? 'warn' : 'info';
+    logger[lvl](`${req.method} ${req.originalUrl} ${res.statusCode} ${ms}ms`, { ip: req.ip, user: req.user?.id });
+  });
+  next();
+};
+
+module.exports = {
+  helmetMw, globalLimit, authLimit, paymentLimit, chatLimit, couponLimit,
+  mongoSanitize: mongoSanitize({ replaceWith: '_' }),
+  hpp: hpp(),
+  sanitizeXSS,
+  reqLogger
+};
+
+const jwt  = require('jsonwebtoken');
+const User = require('../models/User');
+const logger = require('../utils/logger');
+
+const protect = async (req, res, next) => {
+  try {
+    const token = req.headers.authorization?.startsWith('Bearer ')
+      ? req.headers.authorization.split(' ')[1]
+      : req.cookies?.jwt;
+
+    if (!token) return res.status(401).json({ success: false, message: 'Not authenticated. Please log in.' });
+
+    let decoded;
+    try {
+      decoded = jwt.verify(token, process.env.JWT_SECRET);
+    } catch (e) {
+      if (e.name === 'TokenExpiredError')
+        return res.status(401).json({ success: false, code: 'TOKEN_EXPIRED', message: 'Session expired. Please log in again.' });
+      return res.status(401).json({ success: false, message: 'Invalid token.' });
+    }
+
+    const user = await User.findById(decoded.id);
+    if (!user)          return res.status(401).json({ success: false, message: 'User no longer exists.' });
+    if (!user.isActive) return res.status(403).json({ success: false, message: 'Account deactivated.' });
+    if (user.isLocked()) return res.status(423).json({ success: false, message: 'Account temporarily locked.' });
+    if (user.passwordChangedAfter(decoded.iat))
+      return res.status(401).json({ success: false, message: 'Password changed. Please log in again.' });
+
+    req.user = user;
+    next();
+  } catch (err) {
+    logger.error('Auth middleware error', { err: err.message });
+    res.status(500).json({ success: false, message: 'Authentication error.' });
+  }
+};
+
+const restrictTo = (...roles) => (req, res, next) => {
+  if (!roles.includes(req.user.role))
+    return res.status(403).json({ success: false, message: 'You do not have permission for this action.' });
+  next();
+};
+
+const optionalAuth = async (req, _, next) => {
+  try {
+    const token = req.headers.authorization?.split(' ')[1];
+    if (token) {
+      const decoded = jwt.verify(token, process.env.JWT_SECRET);
+      req.user = await User.findById(decoded.id);
+    }
+  } catch {}
+  next();
+};
+
+module.exports = { protect, restrictTo, optionalAuth };
+
+/**
+ * JusPay Payment Gateway Integration
+ * Docs: https://developer.juspay.in/docs
+ * Sandbox: https://sandbox.juspay.in
+ *
+ * Free sandbox account: https://dashboard.juspay.in/register
+ */
+const axios = require('axios');
+const logger = require('../utils/logger');
+
+const BASE   = process.env.JUSPAY_BASE_URL || 'https://sandbox.juspay.in';
+const MID    = process.env.JUSPAY_MERCHANT_ID || 'sandbox_merchant';
+const APIKEY = process.env.JUSPAY_API_KEY    || 'sandbox_key';
+
+const auth = () => `Basic ${Buffer.from(`${APIKEY}:`).toString('base64')}`;
+const headers = () => ({
+  Authorization: auth(),
+  'Content-Type': 'application/json',
+  'x-merchantid': MID,
+  version: '2023-12-01'
+});
+
+/**
+ * Create a JusPay hosted payment session.
+ * Returns a paymentUrl the buyer opens to complete payment.
+ */
+const createSession = async ({ orderId, amount, customerId, email, phone, returnUrl, description }) => {
+  try {
+    const payload = {
+      merchant_id: MID,
+      order_id: orderId,
+      amount: Number(amount).toFixed(2),
+      customer_id: customerId,
+      customer_email: email,
+      customer_phone: phone || '9999999999',
+      payment_page_client_id: MID,
+      action: 'paymentPage',
+      return_url: returnUrl,
+      description: description || 'CouponX Purchase',
+      currency: 'INR'
+    };
+
+    const { data } = await axios.post(`${BASE}/session`, payload, { headers: headers(), timeout: 12000 });
+
+    logger.info('JusPay session created', { orderId, amount });
+    return {
+      ok: true,
+      paymentUrl: data.payment_links?.web || `${BASE}/merchant/pay/${data.id}`,
+      sessionId: data.id,
+      orderId: data.order_id
+    };
+  } catch (err) {
+    logger.error('JusPay createSession failed', { orderId, error: err.response?.data || err.message });
+    throw new Error(err.response?.data?.error_message || 'Payment session creation failed');
+  }
+};
+
+/**
+ * Fetch order status from JusPay.
+ */
+const getOrderStatus = async (orderId) => {
+  try {
+    const { data } = await axios.get(`${BASE}/orders/${orderId}`, { headers: headers(), timeout: 10000 });
+    return {
+      ok: true,
+      orderId: data.order_id,
+      status: data.status,         // CHARGED | PENDING | FAILED | COD_INITIATED
+      amount: data.amount,
+      txnId: data.txn_id,
+      method: data.payment_method,
+      raw: data
+    };
+  } catch (err) {
+    logger.error('JusPay getOrderStatus failed', { orderId, error: err.message });
+    throw new Error('Failed to fetch payment status');
+  }
+};
+
+/**
+ * Initiate a refund via JusPay.
+ * Called automatically when coupon validation fails.
+ */
+const refund = async ({ orderId, amount, refundId, reason }) => {
+  try {
+    const payload = {
+      unique_request_id: refundId,
+      amount: Number(amount).toFixed(2),
+      order_id: orderId
+    };
+
+    const { data } = await axios.post(`${BASE}/orders/${orderId}/refunds`, payload, {
+      headers: headers(), timeout: 12000
+    });
+
+    logger.info('JusPay refund initiated', { orderId, refundId, amount });
+    return { ok: true, refundId: data.id, status: data.status, raw: data };
+  } catch (err) {
+    logger.error('JusPay refund failed', { orderId, error: err.response?.data || err.message });
+    throw new Error(err.response?.data?.error_message || 'Refund initiation failed');
+  }
+};
+
+/**
+ * Map JusPay status strings to our internal payment status.
+ */
+const mapStatus = (s) => ({
+  CHARGED:                'captured',
+  PENDING:                'processing',
+  PENDING_VBV:            'processing',
+  AUTHORIZING:            'processing',
+  STARTED:                'processing',
+  AUTHORIZATION_FAILED:   'failed',
+  AUTHENTICATION_FAILED:  'failed',
+  JUSPAY_DECLINED:        'failed',
+  COD_INITIATED:          'pending',
+  VOID_INITIATED:         'cancelled',
+  VOIDED:                 'cancelled'
+}[s] || 'pending');
+
+module.exports = { createSession, getOrderStatus, refund, mapStatus };
+
+/**
+ * Escrow Service
+ * ─────────────────────────────────────────────────────────────────
+ * Flow:
+ *  1. initiate()        → reserve coupon, create txn, get JusPay URL
+ *  2. onPaymentSuccess()→ money in escrow, start coupon validation
+ *  3. validate()        → check coupon is real + unused
+ *  4. sendOTP()         → OTP generated, sent to buyer
+ *  5. verifyOTP()       → OTP correct → decrypt code, release to seller
+ *
+ * On any failure in steps 3-5: abortAndRefund() → auto refund buyer
+ * ─────────────────────────────────────────────────────────────────
+ */
+const { v4: uuidv4 } = require('uuid');
+const Transaction = require('../models/Transaction');
+const Coupon      = require('../models/Coupon');
+const User        = require('../models/User');
+const juspay      = require('./juspay');
+const { generateOTP, hashOTP, decryptCoupon } = require('../utils/encryption');
+const logger      = require('../utils/logger');
+
+const PLATFORM_FEE_PCT = 5; // 5% platform fee
+
+/* ─── 1. Initiate Purchase ─────────────────────────────────── */
+const initiate = async ({ couponId, buyerId }) => {
+  const coupon = await Coupon.findById(couponId);
+  if (!coupon)                      throw new Error('Coupon not found');
+  if (coupon.status !== 'active')   throw new Error('Coupon is not available');
+  if (coupon.expiryDate < new Date()) throw new Error('Coupon has expired');
+  if (String(coupon.seller) === String(buyerId)) throw new Error('You cannot buy your own coupon');
+
+  const buyer = await User.findById(buyerId);
+  if (!buyer?.isActive) throw new Error('Buyer account is invalid');
+
+  const fee      = Math.round(coupon.salePrice * PLATFORM_FEE_PCT / 100);
+  const payout   = coupon.salePrice - fee;
+  const txnId    = `TXN-${Date.now()}-${uuidv4().slice(0,6).toUpperCase()}`;
+  const orderId  = `ORD-${Date.now()}-${uuidv4().slice(0,6).toUpperCase()}`;
+
+  // Reserve coupon so no one else can buy it
+  await Coupon.findByIdAndUpdate(couponId, { status: 'reserved' });
+
+  // Create transaction record
+  const txn = await Transaction.create({
+    txnId,
+    coupon:       couponId,
+    buyer:        buyerId,
+    seller:       coupon.seller,
+    amount:       coupon.salePrice,
+    platformFee:  fee,
+    sellerPayout: payout,
+    'payment.orderId': orderId,
+    status:       'payment_pending',
+    'escrow.status': 'awaiting_payment',
+    notes: [{ msg: 'Purchase initiated' }]
+  });
+
+  // Create JusPay session
+  const session = await juspay.createSession({
+    orderId,
+    amount:      coupon.salePrice,
+    customerId:  String(buyerId),
+    email:       buyer.email,
+    phone:       buyer.phone || '9999999999',
+    returnUrl:   `${process.env.FRONTEND_URL}/payment/callback?txn=${txnId}`,
+    description: `CouponX: ${coupon.brand} — ${coupon.description.slice(0, 60)}`
+  });
+
+  logger.info('Escrow initiated', { txnId, couponId, buyerId });
+
+  return {
+    txnId,
+    orderId,
+    paymentUrl: session.paymentUrl,
+    amount: coupon.salePrice,
+    coupon: {
+      brand:      coupon.brand,
+      description: coupon.description,
+      maskedCode: coupon.maskedCode,   // ← only masked code, never real
+      faceValue:  coupon.faceValue,
+      expiryDate: coupon.expiryDate
+    }
+  };
+};
+
+/* ─── 2. Payment Confirmed (webhook / poll) ────────────────── */
+const onPaymentSuccess = async ({ orderId, paymentId, raw }) => {
+  const txn = await Transaction.findOne({ 'payment.orderId': orderId });
+  if (!txn) throw new Error(`No transaction for order ${orderId}`);
+  if (txn.escrow.status !== 'awaiting_payment') {
+    logger.warn('Duplicate payment event ignored', { orderId });
+    return txn;
+  }
+
+  txn.payment.status    = 'captured';
+  txn.payment.paymentId = paymentId;
+  txn.payment.paidAt    = new Date();
+  txn.payment.raw       = raw;
+  txn.escrow.status     = 'payment_received';
+  txn.escrow.heldAt     = new Date();
+  txn.status            = 'in_escrow';
+  txn.notes.push({ msg: 'Payment captured — held in escrow' });
+  await txn.save();
+
+  // Kick off validation asynchronously
+  validate(txn._id).catch(err => logger.error('Validation error', { txnId: txn.txnId, err: err.message }));
+  return txn;
+};
+
+/* ─── 3. Validate Coupon ───────────────────────────────────── */
+const validate = async (txnMongoId) => {
+  const txn = await Transaction.findById(txnMongoId).populate('coupon');
+  if (!txn) throw new Error('Transaction not found');
+
+  txn.escrow.status        = 'validating';
+  txn.validation.status    = 'in_progress';
+  txn.validation.attempts += 1;
+  txn.notes.push({ msg: 'Coupon validation started' });
+  await txn.save();
+
+  // ── Validation checks ─────────────────────────────────────
+  const coupon = await Coupon.findById(txn.coupon._id);
+
+  if (!coupon) {
+    return abortAndRefund(txn._id, 'Coupon no longer exists');
+  }
+  if (coupon.expiryDate < new Date()) {
+    return abortAndRefund(txn._id, 'Coupon expired during transaction');
+  }
+  if (coupon.status !== 'reserved') {
+    return abortAndRefund(txn._id, 'Coupon is no longer available');
+  }
+
+  // ── Validation passed: generate OTP ───────────────────────
+  const otp     = generateOTP(6);
+  const otpHash = hashOTP(otp);
+  const otpExp  = new Date(Date.now() + (parseInt(process.env.OTP_EXPIRY_MINUTES) || 10) * 60000);
+
+  await Coupon.findByIdAndUpdate(coupon._id, {
+    'otp.hash':      otpHash,
+    'otp.expiresAt': otpExp,
+    'otp.attempts':  0
+  });
+
+  txn.validation.status  = 'passed';
+  txn.validation.doneAt  = new Date();
+  txn.escrow.status      = 'otp_pending';
+  txn.notes.push({ msg: `Validation passed. OTP generated: ${otp} (dev-visible only)` });
+  await txn.save();
+
+  logger.info('Coupon validated, OTP ready', { txnId: txn.txnId, otp /* remove in prod */ });
+
+  // TODO: SMS/email OTP to buyer via Twilio / AWS SNS
+  // await smsService.send(buyer.phone, `Your CouponX OTP: ${otp}. Valid for 10 min.`);
+};
+
+/* ─── 4+5. Verify OTP → Reveal Code → Release Escrow ──────── */
+const verifyOTP = async ({ txnId, buyerId, otp }) => {
+  const txn = await Transaction.findOne({ txnId });
+  if (!txn)                                     throw new Error('Transaction not found');
+  if (String(txn.buyer) !== String(buyerId))    throw new Error('Unauthorized');
+  if (txn.escrow.status !== 'otp_pending')      throw new Error('OTP not expected at this stage');
+
+  // Fetch coupon with encrypted code + otp (both select: false)
+  const coupon = await Coupon.findById(txn.coupon).select('+encryptedCode +otp');
+  if (!coupon) throw new Error('Coupon not found');
+
+  // Max attempts guard
+  if (coupon.otp.attempts >= 3) {
+    await abortAndRefund(txn._id, 'Too many incorrect OTP attempts');
+    throw new Error('Too many OTP attempts. Your payment has been refunded.');
+  }
+
+  // Expiry check
+  if (coupon.otp.expiresAt < new Date()) {
+    await abortAndRefund(txn._id, 'OTP expired without verification');
+    throw new Error('OTP expired. Your payment has been refunded.');
+  }
+
+  // Verify
+  const expected = hashOTP(String(otp).trim());
+  if (coupon.otp.hash !== expected) {
+    await Coupon.findByIdAndUpdate(coupon._id, { $inc: { 'otp.attempts': 1 } });
+    const left = 3 - (coupon.otp.attempts + 1);
+    throw new Error(`Incorrect OTP. ${left} attempt(s) remaining.`);
+  }
+
+  // ── SUCCESS: decrypt code ──────────────────────────────────
+  const realCode = decryptCoupon(coupon.encryptedCode);
+
+  // Mark coupon sold
+  await Coupon.findByIdAndUpdate(coupon._id, {
+    status:       'sold',
+    buyer:        buyerId,
+    soldAt:       new Date(),
+    'otp.hash':   null
+  });
+
+  // Release escrow
+  txn.escrow.status     = 'released';
+  txn.escrow.releasedAt = new Date();
+  txn.status            = 'completed';
+  txn.completedAt       = new Date();
+  txn.notes.push({ msg: 'OTP verified. Escrow released to seller.' });
+  await txn.save();
+
+  // Credit seller wallet
+  await User.findByIdAndUpdate(txn.seller, {
+    $inc: { 'wallet.balance': txn.sellerPayout, totalTransactions: 1, successfulTransactions: 1 }
+  });
+  await User.findByIdAndUpdate(txn.buyer, {
+    $inc: { totalTransactions: 1, successfulTransactions: 1 }
+  });
+
+  logger.info('Escrow released, coupon delivered', { txnId });
+
+  return {
+    success:   true,
+    couponCode: realCode,      // ← First and only time the real code is returned
+    brand:     coupon.brand,
+    expiryDate: coupon.expiryDate,
+    terms:     coupon.terms
+  };
+};
+
+/* ─── Abort + Auto-Refund ──────────────────────────────────── */
+const abortAndRefund = async (txnMongoId, reason) => {
+  const txn = await Transaction.findById(txnMongoId);
+  if (!txn) return;
+
+  logger.warn('Escrow abort initiated', { txnId: txn.txnId, reason });
+
+  // Release coupon back to active
+  await Coupon.findByIdAndUpdate(txn.coupon, { status: 'active', buyer: null });
+
+  // Trigger JusPay refund if payment was captured
+  let refundResult = null;
+  if (txn.payment.orderId && txn.payment.status === 'captured') {
+    try {
+      refundResult = await juspay.refund({
+        orderId:  txn.payment.orderId,
+        amount:   txn.amount,
+        refundId: `REF-${txn.txnId}`,
+        reason
+      });
+      txn.payment.refundId    = refundResult.refundId;
+      txn.payment.refundedAt  = new Date();
+      txn.payment.refundReason = reason;
+      txn.payment.status      = 'refunded';
+    } catch (refErr) {
+      logger.error('Auto-refund failed — manual action required', { txnId: txn.txnId, err: refErr.message });
+      txn.notes.push({ msg: `⚠️ MANUAL REFUND NEEDED: ${refErr.message}` });
+    }
+  }
+
+  txn.escrow.status     = 'aborted';
+  txn.escrow.abortedAt  = new Date();
+  txn.escrow.abortReason = reason;
+  txn.status            = 'refunded';
+  txn.validation.status = 'failed';
+  txn.validation.failReason = reason;
+  txn.notes.push({ msg: `Aborted: ${reason}` });
+  await txn.save();
+
+  return { aborted: true, reason };
+};
+
+module.exports = { initiate, onPaymentSuccess, validate, verifyOTP, abortAndRefund };
+
+const axios   = require('axios');
+const logger  = require('../utils/logger');
+
+const API_URL = 'https://api.anthropic.com/v1/messages';
+const MODEL   = 'claude-sonnet-4-6';
+
+const call = async (payload) => {
+  const { data } = await axios.post(API_URL, { model: MODEL, max_tokens: 600, ...payload }, {
+    headers: {
+      'x-api-key': process.env.ANTHROPIC_API_KEY,
+      'anthropic-version': '2023-06-01',
+      'Content-Type': 'application/json'
+    },
+    timeout: 20000
+  });
+  return data.content[0].text.trim();
+};
+
+/* ── Coupon AI Scoring ─────────────────────────────────────── */
+const scoreCoupon = async ({ brand, category, description, faceValue, salePrice, minOrder, expiryDate }) => {
+  const daysLeft  = Math.ceil((new Date(expiryDate) - Date.now()) / 86400000);
+  const savingPct = Math.round(((faceValue - salePrice) / faceValue) * 100);
+
+  const prompt = `You are a coupon fraud detection and valuation AI for an Indian marketplace.
+Analyze this coupon and respond ONLY with valid JSON — no markdown, no extra text.
+
+Brand: ${brand}
+Category: ${category}
+Description: ${description}
+Face Value: ₹${faceValue}
+Sale Price: ₹${salePrice}
+Savings: ${savingPct}%
+Min Order: ₹${minOrder || 0}
+Days Left: ${daysLeft}
+
+JSON schema:
+{
+  "score": <0-100 integer>,
+  "rating": "<hot|good|weak>",
+  "fraudRisk": "<low|medium|high>",
+  "flags": [<string reasons if any>],
+  "recommendation": "<one sentence>",
+  "analysis": "<2-3 sentences>",
+  "suggestedPrice": <fair integer price in INR>
+}`;
+
+  try {
+    const text   = await call({ messages: [{ role: 'user', content: prompt }] });
+    const clean  = text.replace(/```json|```/g, '').trim();
+    return JSON.parse(clean);
+  } catch (err) {
+    logger.warn('AI scoring fallback used', { err: err.message });
+    return fallbackScore(daysLeft, savingPct, minOrder, faceValue);
+  }
+};
+
+const fallbackScore = (daysLeft, savingPct, minOrder, faceValue) => {
+  let score = 50;
+  if (savingPct > 70) score += 25; else if (savingPct > 50) score += 15; else if (savingPct > 30) score += 8;
+  if (daysLeft > 30) score += 15; else if (daysLeft > 14) score += 8; else if (daysLeft < 5) score -= 15;
+  if (!minOrder) score += 10; else if (minOrder < faceValue * 2) score += 5;
+  score = Math.min(100, Math.max(0, score));
+  return {
+    score, rating: score >= 75 ? 'hot' : score >= 55 ? 'good' : 'weak',
+    fraudRisk: 'low', flags: [], recommendation: 'Auto-scored (AI unavailable).',
+    analysis: `${savingPct}% savings with ${daysLeft} days remaining.`,
+    suggestedPrice: Math.round(faceValue * 0.4)
+  };
+};
+
+/* ── Customer Support Chatbot ──────────────────────────────── */
+const SYSTEM = `You are CouponX Support — a helpful, concise, friendly support agent.
+
+PLATFORM FACTS:
+• CouponX is a peer-to-peer coupon marketplace in India
+• Buyers purchase verified coupons at discounted prices; sellers monetise unused coupons
+• All transactions use escrow: buyer pays → money held → coupon validated → OTP sent → buyer enters OTP → code revealed → seller paid
+• Coupon codes are AES-256 encrypted and NEVER shown until OTP verification succeeds
+• If coupon validation fails or too many wrong OTPs: payment is AUTOMATICALLY refunded (3-5 business days)
+• Platform fee: 5% (charged to seller)
+• OTP expires in 10 minutes, max 3 attempts
+
+RULES:
+• Be concise and helpful
+• If you cannot resolve an account/technical issue, say "I'll escalate this — expect a reply within 2 hours"
+• Never reveal internal implementation details`;
+
+const chat = async ({ message, history = [], userCtx = null }) => {
+  const messages = [
+    ...history.slice(-12).map(m => ({ role: m.role, content: m.content })),
+    { role: 'user', content: message }
+  ];
+
+  const extra = userCtx ? `\n\nUser context: name=${userCtx.name}, role=${userCtx.role}` : '';
+
+  try {
+    const reply = await call({ system: SYSTEM + extra, messages });
+    return { role: 'assistant', content: reply };
+  } catch (err) {
+    logger.error('Chatbot error', { err: err.message });
+    return { role: 'assistant', content: "I'm having trouble right now. For urgent help, email support@couponx.in 🙏" };
+  }
+};
+
+module.exports = { scoreCoupon, chat };
+
+const mongoose = require('mongoose');
+
+const noteSchema = new mongoose.Schema({
+  msg: String,
+  by:  { type: String, default: 'system' },
+  at:  { type: Date, default: Date.now }
+}, { _id: false });
+
+const transactionSchema = new mongoose.Schema({
+  txnId:  { type: String, required: true, unique: true },
+  coupon: { type: mongoose.Schema.Types.ObjectId, ref: 'Coupon', required: true },
+  buyer:  { type: mongoose.Schema.Types.ObjectId, ref: 'User',   required: true },
+  seller: { type: mongoose.Schema.Types.ObjectId, ref: 'User',   required: true },
+
+  amount:          { type: Number, required: true },
+  platformFee:     { type: Number, default: 0 },
+  sellerPayout:    { type: Number, required: true },
+
+  // JusPay payment details
+  payment: {
+    orderId:   String,
+    sessionId: String,
+    paymentId: String,
+    method:    String,
+    status: {
+      type: String,
+      enum: ['pending','processing','captured','failed','refunded','cancelled'],
+      default: 'pending'
+    },
+    paidAt:       Date,
+    refundId:     String,
+    refundedAt:   Date,
+    refundReason: String,
+    raw:          mongoose.Schema.Types.Mixed
+  },
+
+  // Escrow lifecycle
+  escrow: {
+    status: {
+      type: String,
+      enum: [
+        'awaiting_payment',   // Buyer hasn't paid yet
+        'payment_received',   // Money captured, held in escrow
+        'validating',         // Coupon being validated
+        'otp_pending',        // OTP sent to buyer
+        'released',           // Escrow released to seller ✅
+        'aborted',            // Validation failed → refund triggered
+        'disputed'            // Dispute raised
+      ],
+      default: 'awaiting_payment'
+    },
+    heldAt:       Date,
+    releasedAt:   Date,
+    abortedAt:    Date,
+    abortReason:  String
+  },
+
+  // Coupon validation result
+  validation: {
+    status:    { type: String, enum: ['not_started','in_progress','passed','failed'], default: 'not_started' },
+    failReason: String,
+    doneAt:    Date,
+    attempts:  { type: Number, default: 0 }
+  },
+
+  // Overall transaction status
+  status: {
+    type: String,
+    enum: ['initiated','payment_pending','in_escrow','completed','failed','refunded','disputed'],
+    default: 'initiated'
+  },
+
+  completedAt: Date,
+  notes:       [noteSchema],
+
+  // Post-transaction ratings
+  buyerRating:  { score: Number, comment: String, at: Date },
+  sellerRating: { score: Number, comment: String, at: Date }
+}, { timestamps: true });
+
+transactionSchema.index({ txnId: 1 });
+transactionSchema.index({ buyer: 1, status: 1 });
+transactionSchema.index({ seller: 1, status: 1 });
+transactionSchema.index({ 'payment.orderId': 1 });
+
+module.exports = mongoose.model('Transaction', transactionSchema);
+
+const mongoose = require('mongoose');
+const bcrypt = require('bcryptjs');
+
+const userSchema = new mongoose.Schema({
+  name:     { type: String, required: true, trim: true, maxlength: 60 },
+  email:    { type: String, required: true, unique: true, lowercase: true, match: [/^\S+@\S+\.\S+$/, 'Invalid email'] },
+  password: { type: String, required: true, minlength: 8, select: false },
+  phone:    { type: String, default: '' },
+  role:     { type: String, enum: ['buyer', 'seller', 'admin'], default: 'buyer' },
+
+  isActive:   { type: Boolean, default: true },
+  isVerified: { type: Boolean, default: false },
+
+  trustScore:             { type: Number, default: 100, min: 0, max: 100 },
+  totalTransactions:      { type: Number, default: 0 },
+  successfulTransactions: { type: Number, default: 0 },
+
+  wallet: {
+    balance:       { type: Number, default: 0 },
+    escrowBalance: { type: Number, default: 0 }
+  },
+
+  // Security
+  loginAttempts:    { type: Number, default: 0 },
+  lockUntil:        { type: Date },
+  refreshToken:     { type: String, select: false },
+  passwordChanged:  { type: Date },
+  lastLogin:        { type: Date }
+}, { timestamps: true });
+
+// Hash password
+userSchema.pre('save', async function (next) {
+  if (!this.isModified('password')) return next();
+  this.password = await bcrypt.hash(this.password, 12);
+  this.passwordChanged = new Date();
+  next();
+});
+
+userSchema.methods.matchPassword = async function (plain) {
+  return bcrypt.compare(plain, this.password);
+};
+
+userSchema.methods.isLocked = function () {
+  return this.lockUntil && this.lockUntil > Date.now();
+};
+
+userSchema.methods.incAttempts = async function () {
+  if (this.lockUntil && this.lockUntil < Date.now()) {
+    return this.updateOne({ $set: { loginAttempts: 1 }, $unset: { lockUntil: 1 } });
+  }
+  const updates = { $inc: { loginAttempts: 1 } };
+  if (this.loginAttempts + 1 >= 5) {
+    updates.$set = { lockUntil: Date.now() + 2 * 60 * 60 * 1000 }; // 2 hr lock
+  }
+  return this.updateOne(updates);
+};
+
+userSchema.methods.passwordChangedAfter = function (jwtIat) {
+  if (this.passwordChanged) {
+    return Math.floor(this.passwordChanged.getTime() / 1000) > jwtIat;
+  }
+  return false;
+};
+
+userSchema.virtual('successRate').get(function () {
+  return this.totalTransactions === 0 ? 100
+    : Math.round((this.successfulTransactions / this.totalTransactions) * 100);
+});
+
+userSchema.set('toJSON', { virtuals: true });
+
+module.exports = mongoose.model('User', userSchema);
+
+const mongoose = require('mongoose');
+
+const couponSchema = new mongoose.Schema({
+  seller:      { type: mongoose.Schema.Types.ObjectId, ref: 'User', required: true },
+  buyer:       { type: mongoose.Schema.Types.ObjectId, ref: 'User', default: null },
+
+  brand:       { type: String, required: true, trim: true, maxlength: 100 },
+  category:    { type: String, required: true, enum: ['food','shopping','travel','health','entertainment','other'] },
+  description: { type: String, required: true, maxlength: 500 },
+
+  // AES-256 encrypted — NEVER returned in API responses until escrow released
+  encryptedCode: { type: String, required: true, select: false },
+  // Shown to buyers before purchase (e.g. "SAV*****")
+  maskedCode:    { type: String, required: true },
+
+  faceValue:    { type: Number, required: true, min: 1 },
+  salePrice:    { type: Number, required: true, min: 1 },
+  minOrder:     { type: Number, default: 0 },
+  expiryDate:   { type: Date, required: true },
+  terms:        { type: String, maxlength: 1000, default: '' },
+  applicableOn: { type: String, maxlength: 200, default: '' },
+
+  status: {
+    type: String,
+    enum: ['pending_review', 'active', 'reserved', 'sold', 'expired', 'flagged', 'removed'],
+    default: 'pending_review'
+  },
+
+  // AI scoring
+  ai: {
+    score:      { type: Number, min: 0, max: 100, default: null },
+    rating:     { type: String, enum: ['hot','good','weak','unrated'], default: 'unrated' },
+    fraudRisk:  { type: String, enum: ['low','medium','high'], default: 'low' },
+    flags:      [String],
+    scoredAt:   Date
+  },
+
+  // OTP for transfer — stored hashed, selected explicitly
+  otp: {
+    hash:      { type: String, select: false },
+    expiresAt: { type: Date },
+    attempts:  { type: Number, default: 0 }
+  },
+
+  views:       { type: Number, default: 0 },
+  soldAt:      { type: Date }
+}, { timestamps: true });
+
+couponSchema.virtual('daysLeft').get(function () {
+  return Math.ceil((this.expiryDate - Date.now()) / 86400000);
+});
+couponSchema.virtual('savingPct').get(function () {
+  return Math.round(((this.faceValue - this.salePrice) / this.faceValue) * 100);
+});
+
+couponSchema.set('toJSON', { virtuals: true });
+couponSchema.set('toObject', { virtuals: true });
+
+couponSchema.index({ status: 1, category: 1 });
+couponSchema.index({ seller: 1 });
+couponSchema.index({ expiryDate: 1 });
+couponSchema.index({ brand: 'text', description: 'text' });
+
+module.exports = mongoose.model('Coupon', couponSchema);
+
+require('dotenv').config();
+const express = require('express');
+const cors    = require('cors');
+const cron    = require('node-cron');
+
+const connectDB = require('./config/db');
+const routes    = require('./routes/index');
+const logger    = require('./utils/logger');
+const {
+  helmetMw, globalLimit, mongoSanitize, hpp,
+  sanitizeXSS, reqLogger
+} = require('./middleware/security');
+
+const app = express();
+connectDB();
+
+/* ── Security ─────────────────────────────────────────────── */
+app.use(helmetMw);
+app.use(cors({
+  origin: (process.env.FRONTEND_URL || 'http://localhost:3000').split(','),
+  credentials: true,
+  methods: ['GET','POST','PUT','DELETE','PATCH'],
+  allowedHeaders: ['Content-Type','Authorization']
+}));
+app.use(globalLimit);
+app.use(mongoSanitize);
+app.use(hpp);
+app.use(reqLogger);
+
+/* ── Body Parsing ─────────────────────────────────────────── */
+// Webhook route needs raw body BEFORE json parser
+app.use('/api/payments/webhook', express.raw({ type: '*/*' }));
+app.use(express.json({ limit: '10kb' }));
+app.use(express.urlencoded({ extended: true, limit: '10kb' }));
+app.use(sanitizeXSS);
+
+/* ── Routes ───────────────────────────────────────────────── */
+app.use('/api', routes);
+
+/* ── 404 ──────────────────────────────────────────────────── */
+app.use((req, res) => res.status(404).json({ success: false, message: `${req.originalUrl} not found` }));
+
+/* ── Global Error Handler ─────────────────────────────────── */
+app.use((err, req, res, next) => {
+  logger.error('Unhandled', { msg: err.message, stack: err.stack });
+  if (err.code === 11000) {
+    const field = Object.keys(err.keyValue || {})[0] || 'field';
+    return res.status(409).json({ success: false, message: `${field} already exists.` });
+  }
+  if (err.name === 'ValidationError') {
+    const msgs = Object.values(err.errors).map(e => e.message);
+    return res.status(400).json({ success: false, message: msgs.join('. ') });
+  }
+  res.status(err.statusCode || 500).json({
+    success: false,
+    message: process.env.NODE_ENV === 'production' ? 'Something went wrong.' : err.message
+  });
+});
+
+/* ── Cron: expire coupons ─────────────────────────────────── */
+cron.schedule('0 * * * *', async () => {
+  try {
+    const Coupon = require('./models/Coupon');
+    const r = await Coupon.updateMany(
+      { expiryDate: { $lt: new Date() }, status: { $in: ['active','pending_review'] } },
+      { $set: { status: 'expired' } }
+    );
+    if (r.modifiedCount) logger.info(`Cron: expired ${r.modifiedCount} coupons`);
+  } catch (e) { logger.error('Cron error', { e: e.message }); }
+});
+
+/* ── Start ────────────────────────────────────────────────── */
+const PORT = process.env.PORT || 5000;
+const server = app.listen(PORT, () =>
+  logger.info(`CouponX API listening on :${PORT} [${process.env.NODE_ENV || 'development'}]`)
+);
+
+process.on('unhandledRejection', err => { logger.error('UnhandledRejection', { msg: err.message }); server.close(() => process.exit(1)); });
+process.on('SIGTERM', ()          => server.close(() => { logger.info('Graceful shutdown'); process.exit(0); }));
+
+module.exports = app;
+
+const winston = require('winston');
+const path = require('path');
+const fs = require('fs');
+
+// Ensure logs directory exists
+const logsDir = path.join(process.cwd(), 'logs');
+if (!fs.existsSync(logsDir)) fs.mkdirSync(logsDir, { recursive: true });
+
+const logger = winston.createLogger({
+  level: process.env.NODE_ENV === 'production' ? 'warn' : 'debug',
+  format: winston.format.combine(
+    winston.format.timestamp({ format: 'YYYY-MM-DD HH:mm:ss' }),
+    winston.format.errors({ stack: true }),
+    winston.format.json()
+  ),
+  transports: [
+    new winston.transports.Console({
+      format: winston.format.combine(
+        winston.format.colorize(),
+        winston.format.printf(({ timestamp, level, message, ...meta }) => {
+          const extra = Object.keys(meta).length ? ' ' + JSON.stringify(meta) : '';
+          return `${timestamp} [${level}]: ${message}${extra}`;
+        })
+      )
+    }),
+    new winston.transports.File({ filename: path.join(logsDir, 'error.log'), level: 'error', maxsize: 5e6, maxFiles: 3 }),
+    new winston.transports.File({ filename: path.join(logsDir, 'app.log'), maxsize: 5e6, maxFiles: 3 })
+  ]
+});
+
+module.exports = logger;
+
+const crypto = require('crypto');
+
+const ALGORITHM = 'aes-256-cbc';
+
+// Derive key safely: fallback to a deterministic key in dev if env not set
+const getKey = () => {
+  const k = process.env.COUPON_ENCRYPTION_KEY;
+  if (k && k.length === 64) return Buffer.from(k, 'hex');
+  // Dev fallback — never use in production
+  return crypto.scryptSync('dev-secret', 'couponx-salt', 32);
+};
+
+/**
+ * Encrypt a coupon code for secure storage.
+ * Returns "ivHex:encryptedHex"
+ */
+const encryptCoupon = (plaintext) => {
+  const iv = crypto.randomBytes(16);
+  const cipher = crypto.createCipheriv(ALGORITHM, getKey(), iv);
+  const encrypted = Buffer.concat([cipher.update(plaintext, 'utf8'), cipher.final()]);
+  return `${iv.toString('hex')}:${encrypted.toString('hex')}`;
+};
+
+/**
+ * Decrypt a coupon code. Only called after successful escrow release.
+ */
+const decryptCoupon = (encryptedData) => {
+  const [ivHex, encHex] = encryptedData.split(':');
+  const iv = Buffer.from(ivHex, 'hex');
+  const encrypted = Buffer.from(encHex, 'hex');
+  const decipher = crypto.createDecipheriv(ALGORITHM, getKey(), iv);
+  return Buffer.concat([decipher.update(encrypted), decipher.final()]).toString('utf8');
+};
+
+/**
+ * Generate a cryptographically secure numeric OTP.
+ */
+const generateOTP = (length = 6) => {
+  let otp = '';
+  while (otp.length < length) {
+    otp += crypto.randomInt(0, 10);
+  }
+  return otp.slice(0, length);
+};
+
+/**
+ * Hash OTP with HMAC-SHA256 for storage. Never store plain OTPs.
+ */
+const hashOTP = (otp) => {
+  return crypto.createHmac('sha256', process.env.JWT_SECRET || 'dev-hmac-secret')
+    .update(String(otp))
+    .digest('hex');
+};
+
+/**
+ * Mask a coupon code for public display before purchase.
+ * e.g. "SAVE500OFF" → "SAV*******"
+ */
+const maskCode = (code) => {
+  if (!code || code.length <= 3) return '***';
+  const show = Math.max(2, Math.floor(code.length * 0.25));
+  return code.slice(0, show) + '*'.repeat(code.length - show);
+};
+
+/**
+ * Verify JusPay webhook HMAC signature.
+ */
+const verifyHmac = (payload, signature, secret) => {
+  try {
+    const expected = crypto.createHmac('sha256', secret).update(payload).digest('hex');
+    return crypto.timingSafeEqual(Buffer.from(signature, 'hex'), Buffer.from(expected, 'hex'));
+  } catch {
+    return false;
+  }
+};
+
+module.exports = { encryptCoupon, decryptCoupon, generateOTP, hashOTP, maskCode, verifyHmac };
+
+/**
+ * Seed script — creates demo users and coupons
+ * Usage: node src/utils/seed.js
+ */
+require('dotenv').config();
+const mongoose = require('mongoose');
+const User   = require('../models/User');
+const Coupon = require('../models/Coupon');
+const { encryptCoupon, maskCode } = require('./encryption');
+
+const COUPONS = [
+  { brand: 'Swiggy',      category: 'food',          description: '₹300 off on orders above ₹699', code: 'SWIG300SAVE', faceValue: 300,  salePrice: 129, minOrder: 699,  days: 30 },
+  { brand: 'Zomato',      category: 'food',          description: '₹200 off, no minimum order',    code: 'ZOM200FREE',  faceValue: 200,  salePrice: 79,  minOrder: 0,    days: 25 },
+  { brand: 'Amazon',      category: 'shopping',      description: '₹500 off on electronics',       code: 'AMZN500ELEC', faceValue: 500,  salePrice: 189, minOrder: 2999, days: 20 },
+  { brand: 'Myntra',      category: 'shopping',      description: '₹700 off on fashion above ₹1999', code: 'MYNT700FSH', faceValue: 700,  salePrice: 249, minOrder: 1999, days: 15 },
+  { brand: 'MakeMyTrip',  category: 'travel',        description: '₹1500 off on flights',          code: 'MMT1500FLY',  faceValue: 1500, salePrice: 599, minOrder: 5000, days: 10 },
+  { brand: 'Ola',         category: 'travel',        description: '₹150 off on 3 rides',           code: 'OLA3RIDE150', faceValue: 150,  salePrice: 55,  minOrder: 0,    days: 6  },
+  { brand: 'Cult.fit',    category: 'health',        description: '₹999 off 3-month membership',   code: 'CULT3MO999',  faceValue: 999,  salePrice: 349, minOrder: 0,    days: 45 },
+  { brand: 'PharmEasy',   category: 'health',        description: '20% off on all medicines',      code: 'PHARMA20PCT', faceValue: 400,  salePrice: 129, minOrder: 499,  days: 22 },
+  { brand: 'BookMyShow',  category: 'entertainment', description: '₹250 off on movie tickets',     code: 'BMS250MVIE',  faceValue: 250,  salePrice: 89,  minOrder: 0,    days: 18 },
+  { brand: 'Flipkart',    category: 'shopping',      description: '₹600 off on appliances',        code: 'FK600APPL',   faceValue: 600,  salePrice: 219, minOrder: 3999, days: 12 },
+];
+
+const AI_SCORES = [88, 94, 72, 78, 65, 58, 82, 76, 85, 71];
+
+async function seed() {
+  await mongoose.connect(process.env.MONGODB_URI);
+  console.log('Connected to MongoDB');
+
+  // Clean
+  await Promise.all([User.deleteMany({}), Coupon.deleteMany({})]);
+
+  // Create users
+  const seller = await User.create({ name: 'Demo Seller', email: 'seller@couponx.demo', password: 'Seller@123', role: 'seller', isVerified: true, trustScore: 95, totalTransactions: 42, successfulTransactions: 41 });
+  const buyer  = await User.create({ name: 'Demo Buyer',  email: 'buyer@couponx.demo',  password: 'Buyer@123',  role: 'buyer',  isVerified: true, trustScore: 90 });
+  const admin  = await User.create({ name: 'Admin',       email: 'admin@couponx.demo',  password: 'Admin@123',  role: 'admin',  isVerified: true });
+
+  console.log('Users created: seller@couponx.demo / seller@couponx.demo / admin@couponx.demo (all pw: role@123 with capital first letter)');
+
+  // Create coupons
+  const expiry = (days) => new Date(Date.now() + days * 86400000);
+  for (let i = 0; i < COUPONS.length; i++) {
+    const c = COUPONS[i];
+    const sc = AI_SCORES[i];
+    await Coupon.create({
+      seller:        seller._id,
+      brand:         c.brand,
+      category:      c.category,
+      description:   c.description,
+      encryptedCode: encryptCoupon(c.code),
+      maskedCode:    maskCode(c.code),
+      faceValue:     c.faceValue,
+      salePrice:     c.salePrice,
+      minOrder:      c.minOrder,
+      expiryDate:    expiry(c.days),
+      terms:         'Valid on app only. Cannot be combined with other offers.',
+      status:        'active',
+      ai: { score: sc, rating: sc >= 80 ? 'hot' : sc >= 60 ? 'good' : 'weak', fraudRisk: 'low', scoredAt: new Date() }
+    });
+  }
+
+  console.log(`${COUPONS.length} coupons seeded`);
+  console.log('\nDemo credentials:\n  Buyer:  buyer@couponx.demo  / Buyer@123\n  Seller: seller@couponx.demo / Seller@123\n  Admin:  admin@couponx.demo  / Admin@123');
+  await mongoose.disconnect();
+  process.exit(0);
+}
+
+seed().catch(err => { console.error(err); process.exit(1); });
+
+const express = require('express');
+const { body } = require('express-validator');
+const r = express.Router();
+
+const auth    = require('../controllers/auth');
+const coupon  = require('../controllers/coupon');
+const payment = require('../controllers/payment');
+const chat    = require('../controllers/chat');
+const { protect, restrictTo, optionalAuth } = require('../middleware/auth');
+const { authLimit, paymentLimit, chatLimit, couponLimit } = require('../middleware/security');
+
+/* ── Health ──────────────────────────────────────────────── */
+r.get('/health', (_, res) => res.json({ ok: true, ts: new Date() }));
+
+/* ── Auth ────────────────────────────────────────────────── */
+r.post('/auth/register', authLimit, [
+  body('name').trim().notEmpty().isLength({ max: 60 }),
+  body('email').isEmail().normalizeEmail(),
+  body('password').isLength({ min: 8 }).matches(/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/).withMessage('Password must have uppercase, lowercase and a number'),
+  body('role').optional().isIn(['buyer','seller'])
+], auth.register);
+
+r.post('/auth/login', authLimit, [
+  body('email').isEmail().normalizeEmail(),
+  body('password').notEmpty()
+], auth.login);
+
+r.post('/auth/refresh', auth.refresh);
+r.post('/auth/logout', protect, auth.logout);
+r.get('/auth/me', protect, auth.me);
+
+/* ── Coupons ─────────────────────────────────────────────── */
+r.get('/coupons',              optionalAuth, coupon.list);
+r.get('/coupons/my/listings',  protect, restrictTo('seller','admin'), coupon.myListings);
+r.get('/coupons/:id',          optionalAuth, coupon.get);
+r.post('/coupons', protect, restrictTo('seller','admin'), couponLimit, [
+  body('brand').trim().notEmpty().isLength({ max: 100 }),
+  body('category').isIn(['food','shopping','travel','health','entertainment','other']),
+  body('description').trim().notEmpty().isLength({ max: 500 }),
+  body('couponCode').trim().notEmpty().isLength({ min: 3, max: 50 }),
+  body('faceValue').isFloat({ min: 1 }),
+  body('salePrice').isFloat({ min: 1 }),
+  body('expiryDate').isISO8601()
+], coupon.create);
+r.delete('/coupons/:id', protect, coupon.remove);
+
+/* ── Payments ────────────────────────────────────────────── */
+// Webhook must receive raw body — registered before json parser in server.js
+r.post('/payments/webhook', payment.webhook);
+
+r.post('/payments/initiate',    protect, restrictTo('buyer','admin'), paymentLimit, payment.initiate);
+r.post('/payments/verify-otp',  protect, payment.verifyOTP);
+r.get('/payments/status/:txnId',protect, payment.status);
+r.get('/payments/history',      protect, payment.history);
+r.get('/payments/callback',     payment.callback);
+
+/* ── Chat ────────────────────────────────────────────────── */
+r.post('/chat', chatLimit, optionalAuth, [
+  body('message').trim().notEmpty().isLength({ max: 600 })
+], chat.message);
+
+module.exports = r;
+
+FROM node:20-alpine
+WORKDIR /app
+COPY package*.json ./
+RUN npm install --production
+COPY . .
+RUN mkdir -p logs
+EXPOSE 5000
+CMD ["node", "src/server.js"]
+
+{
+  "name": "couponx-backend",
+  "version": "1.0.0",
+  "main": "src/server.js",
+  "scripts": {
+    "dev": "nodemon src/server.js",
+    "start": "node src/server.js",
+    "seed": "node src/utils/seed.js"
+  },
+  "dependencies": {
+    "axios": "^1.6.2",
+    "bcryptjs": "^2.4.3",
+    "cors": "^2.8.5",
+    "crypto": "^1.0.1",
+    "dotenv": "^16.3.1",
+    "express": "^4.18.2",
+    "express-mongo-sanitize": "^2.2.0",
+    "express-rate-limit": "^7.1.5",
+    "express-validator": "^7.0.1",
+    "helmet": "^7.1.0",
+    "hpp": "^0.2.3",
+    "jsonwebtoken": "^9.0.2",
+    "mongoose": "^8.0.3",
+    "morgan": "^1.10.0",
+    "node-cron": "^3.0.3",
+    "uuid": "^9.0.1",
+    "winston": "^3.11.0",
+    "xss": "^1.0.14"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  }
+}
+
+# ─── Server ─────────────────────────────────────
+NODE_ENV=development
+PORT=5000
+
+# ─── MongoDB ─────────────────────────────────────
+MONGODB_URI=mongodb://localhost:27017/couponx
+# Production: mongodb+srv://user:pass@cluster.mongodb.net/couponx
+
+# ─── JWT ─────────────────────────────────────────
+JWT_SECRET=change_this_to_a_long_random_string_min_64_chars
+JWT_EXPIRE=7d
+JWT_REFRESH_SECRET=another_long_random_string_for_refresh_tokens
+JWT_REFRESH_EXPIRE=30d
+
+# ─── JusPay ──────────────────────────────────────
+# Sign up free at https://dashboard.juspay.in
+JUSPAY_MERCHANT_ID=your_merchant_id
+JUSPAY_API_KEY=your_api_key
+JUSPAY_BASE_URL=https://sandbox.juspay.in
+JUSPAY_WEBHOOK_SECRET=your_webhook_secret
+
+# ─── Coupon Encryption (AES-256) ─────────────────
+# Generate: node -e "console.log(require('crypto').randomBytes(32).toString('hex'))"
+COUPON_ENCRYPTION_KEY=64_char_hex_string_here
+# Generate: node -e "console.log(require('crypto').randomBytes(16).toString('hex'))"
+COUPON_ENCRYPTION_IV=32_char_hex_string_here
+
+# ─── Anthropic AI (Chatbot + Valuation) ──────────
+ANTHROPIC_API_KEY=sk-ant-your-key-here
+
+# ─── Frontend CORS ───────────────────────────────
+FRONTEND_URL=http://localhost:3000
+
+# ─── OTP ─────────────────────────────────────────
+OTP_EXPIRY_MINUTES=10
