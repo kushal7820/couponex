@@ -1,0 +1,1535 @@
+import React from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import toast from 'react-hot-toast';
+
+const col = s => s >= 80 ? '#00e5a0' : s >= 60 ? '#f59e0b' : '#ef4444';
+const lbl = s => s >= 80 ? '🔥 Hot Deal' : s >= 60 ? '👍 Good Deal' : '⚠️ Weak';
+
+export default function CouponCard({ c, onBuy }) {
+  const { user } = useAuth();
+  const nav = useNavigate();
+  const score  = c.ai?.score ?? 70;
+  const color  = col(score);
+  const days   = c.daysLeft ?? Math.ceil((new Date(c.expiryDate) - Date.now()) / 86400000);
+  const savPct = c.savingPct ?? Math.round(((c.faceValue - c.salePrice) / c.faceValue) * 100);
+  const urgent = days <= 5;
+
+  const buy = () => {
+    if (!user) { toast.error('Please login to buy'); nav('/login'); return; }
+    if (user.role === 'seller') { toast.error('Switch to a buyer account to purchase'); return; }
+    onBuy(c);
+  };
+
+  return (
+    <div className="card" style={{ padding:0,overflow:'hidden',cursor:'default' }}
+      onMouseEnter={e=>e.currentTarget.style.transform='translateY(-4px)'}
+      onMouseLeave={e=>e.currentTarget.style.transform=''}>
+
+      {/* Header */}
+      <div style={{ padding:'1.1rem 1.3rem',borderBottom:'1px dashed rgba(255,255,255,.08)',
+        background:'linear-gradient(135deg,var(--sur2),var(--sur))',
+        display:'flex',justifyContent:'space-between',alignItems:'flex-start' }}>
+        <div>
+          <div style={{ fontFamily:'Syne,sans-serif',fontWeight:700,fontSize:'1rem' }}>{c.brand}</div>
+          <div style={{ fontSize:'.68rem',color:'var(--mut)',marginTop:'.18rem',textTransform:'uppercase',letterSpacing:'.06em' }}>{c.category}</div>
+        </div>
+        <div style={{ background:`linear-gradient(135deg,${color},${color}88)`,color:'#000',
+          fontWeight:800,fontSize:'.75rem',padding:'.28rem .6rem',borderRadius:7,whiteSpace:'nowrap' }}>
+          {score}/100
+        </div>
+      </div>
+
+      {/* Body */}
+      <div style={{ padding:'1.1rem 1.3rem' }}>
+        <p style={{ fontSize:'.83rem',color:'var(--mut)',marginBottom:'.9rem',lineHeight:1.55 }}>{c.description}</p>
+
+        {/* Masked code */}
+        <div style={{ fontFamily:'monospace',fontSize:'.95rem',fontWeight:700,
+          background:'rgba(255,255,255,.04)',padding:'.45rem .8rem',
+          borderRadius:8,border:'1px solid var(--bdr)',
+          display:'flex',alignItems:'center',justifyContent:'space-between',marginBottom:'.85rem' }}>
+          <span style={{ letterSpacing:'.08em' }}>{c.maskedCode}</span>
+          <span style={{ fontSize:'.65rem',color:'var(--mut)' }}>🔒 Hidden</span>
+        </div>
+
+        {/* Deal bar */}
+        <div style={{ marginBottom:'.85rem' }}>
+          <div style={{ display:'flex',justifyContent:'space-between',marginBottom:'.28rem' }}>
+            <span style={{ fontSize:'.7rem',color:'var(--mut)' }}>Deal Score</span>
+            <span style={{ fontSize:'.7rem',fontWeight:700,color }}>{lbl(score)}</span>
+          </div>
+          <div className="db"><div className="df" style={{ width:`${score}%`,background:`linear-gradient(90deg,${color},${color}66)` }}/></div>
+        </div>
+
+        {/* Meta */}
+        <div style={{ display:'flex',justifyContent:'space-between',fontSize:'.78rem',color:'var(--mut)',marginBottom:'.9rem' }}>
+          <span>Min: {c.minOrder > 0 ? `₹${c.minOrder}` : 'None'}</span>
+          <span style={{ color: urgent ? 'var(--err)' : 'var(--amb)', fontWeight:500, animation: urgent ? 'blink 1.4s ease infinite' : 'none' }}>
+            ⏱ {days}d left
+          </span>
+        </div>
+
+        {/* Price row */}
+        <div style={{ display:'flex',justifyContent:'space-between',alignItems:'center' }}>
+          <div>
+            <div style={{ fontSize:'.75rem',color:'var(--mut)',textDecoration:'line-through' }}>₹{c.faceValue} value</div>
+            <div style={{ fontFamily:'Syne,sans-serif',fontSize:'1.25rem',fontWeight:800,color:'var(--acc)' }}>
+              ₹{c.salePrice} <span style={{ fontSize:'.68rem',color }}>{savPct}% off</span>
+            </div>
+          </div>
+          <button className="btn btn-purple btn-sm" onClick={buy}>Buy Now →</button>
+        </div>
+
+        {/* Seller */}
+        {c.seller && (
+          <div style={{ marginTop:'.8rem',paddingTop:'.8rem',borderTop:'1px solid var(--bdr)',
+            display:'flex',justifyContent:'space-between',fontSize:'.7rem',color:'var(--mut)' }}>
+            <span>by {c.seller.name}</span>
+            <span style={{ color:'var(--acc)' }}>⭐ {c.seller.trustScore}/100</span>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+import React, { useState } from 'react';
+import { Link, useNavigate, useLocation } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import toast from 'react-hot-toast';
+
+export default function Navbar() {
+  const { user, logout } = useAuth();
+  const nav = useNavigate();
+  const loc = useLocation();
+  const [open, setOpen] = useState(false);
+  const active = p => loc.pathname === p;
+
+  const doLogout = async () => { await logout(); toast.success('Logged out'); nav('/'); };
+
+  const links = [
+    { to: '/marketplace', label: 'Marketplace' },
+    ...(user?.role === 'seller' || user?.role === 'admin' ? [{ to: '/sell', label: 'Sell' }] : []),
+    ...(user ? [{ to: '/dashboard', label: 'Dashboard' }] : [])
+  ];
+
+  return (
+    <nav style={{ position:'fixed',top:0,left:0,right:0,zIndex:200,height:64,
+      background:'rgba(8,12,20,.92)',backdropFilter:'blur(20px)',
+      borderBottom:'1px solid var(--bdr)',display:'flex',alignItems:'center',
+      padding:'0 1.5rem',justifyContent:'space-between',gap:'1rem' }}>
+
+      <Link to="/" style={{ fontFamily:'Syne,sans-serif',fontWeight:800,fontSize:'1.35rem',
+        background:'linear-gradient(135deg,#00e5a0,#00b4ff)',
+        WebkitBackgroundClip:'text',WebkitTextFillColor:'transparent',whiteSpace:'nowrap' }}>
+        CouponX
+      </Link>
+
+      {/* Desktop */}
+      <div style={{ display:'flex',gap:'1.6rem',alignItems:'center',flexWrap:'nowrap' }}>
+        {links.map(l => (
+          <Link key={l.to} to={l.to} style={{
+            color: active(l.to) ? 'var(--acc)' : 'var(--mut)',
+            fontSize:'.88rem',fontWeight:500,transition:'color .2s',whiteSpace:'nowrap'
+          }}>{l.label}</Link>
+        ))}
+        {user ? (
+          <>
+            <span style={{ fontSize:'.82rem',color:'var(--mut)',whiteSpace:'nowrap' }}>
+              {user.role === 'seller' ? '🏪' : '🛒'} {user.name.split(' ')[0]}
+            </span>
+            <button className="btn btn-sm btn-secondary" onClick={doLogout}>Logout</button>
+          </>
+        ) : (
+          <div style={{ display:'flex',gap:'.6rem' }}>
+            <Link to="/login"    className="btn btn-sm btn-secondary">Login</Link>
+            <Link to="/register" className="btn btn-sm btn-primary">Sign Up</Link>
+          </div>
+        )}
+      </div>
+    </nav>
+  );
+}
+
+import React, { useState, useRef, useEffect } from 'react';
+import { chatAPI } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+
+const INIT = [{ role:'assistant', content:"👋 Hi! I'm CouponX Support. Ask me anything about buying, selling, payments, OTPs, or refunds!" }];
+const QUICK = ['How does escrow work?','Why is my code hidden?','How to get a refund?','How to sell a coupon?'];
+
+export default function ChatWidget() {
+  const [open, setOpen] = useState(false);
+  const [msgs, setMsgs] = useState(INIT);
+  const [inp,  setInp]  = useState('');
+  const [busy, setBusy] = useState(false);
+  const [unread, setUnread] = useState(0);
+  const boxRef = useRef(null);
+  const { user } = useAuth();
+
+  useEffect(() => { if (boxRef.current) boxRef.current.scrollTop = boxRef.current.scrollHeight; }, [msgs]);
+  useEffect(() => { if (open) setUnread(0); }, [open]);
+
+  const send = async (text) => {
+    const msg = (text || inp).trim();
+    if (!msg || busy) return;
+    setMsgs(m => [...m, { role:'user', content:msg }]);
+    setInp('');
+    setBusy(true);
+    try {
+      const history = msgs.map(m => ({ role:m.role, content:m.content }));
+      const { data } = await chatAPI.send(msg, history);
+      setMsgs(m => [...m, { role:'assistant', content:data.data.content }]);
+      if (!open) setUnread(u => u+1);
+    } catch {
+      setMsgs(m => [...m, { role:'assistant', content:"I'm having trouble. Email support@couponx.in for urgent help 🙏" }]);
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <>
+      {/* Bubble */}
+      <button onClick={() => setOpen(o => !o)} style={{
+        position:'fixed',bottom:'1.8rem',right:'1.8rem',zIndex:400,
+        width:54,height:54,borderRadius:'50%',border:'none',cursor:'pointer',
+        background:'linear-gradient(135deg,#00e5a0,#00b4ff)',fontSize:'1.3rem',
+        boxShadow:'0 4px 25px rgba(0,229,160,.35)',transition:'transform .2s',
+        display:'flex',alignItems:'center',justifyContent:'center'
+      }}
+        onMouseEnter={e=>e.currentTarget.style.transform='scale(1.1)'}
+        onMouseLeave={e=>e.currentTarget.style.transform=''}>
+        {open ? '✕' : '💬'}
+        {unread > 0 && !open && <span style={{ position:'absolute',top:-4,right:-4,
+          background:'var(--err)',color:'#fff',width:18,height:18,borderRadius:'50%',
+          fontSize:'.6rem',fontWeight:700,display:'flex',alignItems:'center',justifyContent:'center' }}>{unread}</span>}
+      </button>
+
+      {/* Window */}
+      {open && (
+        <div style={{ position:'fixed',bottom:'5.5rem',right:'1.8rem',zIndex:400,
+          width:340,height:490,background:'var(--sur)',border:'1px solid var(--bdr)',
+          borderRadius:20,display:'flex',flexDirection:'column',overflow:'hidden',
+          boxShadow:'0 20px 60px rgba(0,0,0,.55)',animation:'fu .25s ease' }}>
+
+          {/* Header */}
+          <div style={{ padding:'.9rem 1.1rem',borderBottom:'1px solid var(--bdr)',
+            background:'var(--sur2)',display:'flex',alignItems:'center',gap:'.65rem' }}>
+            <div style={{ width:9,height:9,borderRadius:'50%',background:'var(--acc)',animation:'pulse 1.5s ease infinite' }}/>
+            <div>
+              <div style={{ fontFamily:'Syne,sans-serif',fontWeight:700,fontSize:'.88rem' }}>CouponX Support</div>
+              <div style={{ fontSize:'.65rem',color:'var(--mut)' }}>AI-powered · Instant replies</div>
+            </div>
+          </div>
+
+          {/* Messages */}
+          <div ref={boxRef} style={{ flex:1,overflowY:'auto',padding:'1rem',display:'flex',flexDirection:'column',gap:'.75rem' }}>
+            {msgs.map((m,i) => (
+              <div key={i} style={{ display:'flex',gap:'.55rem',flexDirection:m.role==='user'?'row-reverse':'row',alignItems:'flex-end' }}>
+                <div style={{ width:26,height:26,borderRadius:'50%',flexShrink:0,fontSize:'.75rem',
+                  background:m.role==='assistant'?'linear-gradient(135deg,#00e5a0,#00b4ff)':'var(--pur)',
+                  display:'flex',alignItems:'center',justifyContent:'center',color:m.role==='assistant'?'#000':'#fff' }}>
+                  {m.role==='assistant'?'🤖':(user?.name?.[0]||'U')}
+                </div>
+                <div style={{ maxWidth:'78%',padding:'.6rem .85rem',borderRadius:12,fontSize:'.82rem',lineHeight:1.55,
+                  background:m.role==='assistant'?'var(--sur2)':'var(--pur)',
+                  border:m.role==='assistant'?'1px solid var(--bdr)':'none',
+                  color:m.role==='user'?'#fff':'var(--txt)' }}>
+                  {m.content}
+                </div>
+              </div>
+            ))}
+            {busy && (
+              <div style={{ display:'flex',gap:'.55rem',alignItems:'flex-end' }}>
+                <div style={{ width:26,height:26,borderRadius:'50%',background:'linear-gradient(135deg,#00e5a0,#00b4ff)',display:'flex',alignItems:'center',justifyContent:'center',fontSize:'.75rem' }}>🤖</div>
+                <div style={{ background:'var(--sur2)',border:'1px solid var(--bdr)',padding:'.6rem .85rem',borderRadius:12,display:'flex',gap:4 }}>
+                  {[0,150,300].map(d=><span key={d} style={{ width:6,height:6,borderRadius:'50%',background:'var(--mut)',display:'inline-block',animation:`pulse 1s ${d}ms ease infinite` }}/>)}
+                </div>
+              </div>
+            )}
+            {msgs.length === 1 && (
+              <div style={{ display:'flex',flexWrap:'wrap',gap:'.38rem' }}>
+                {QUICK.map(q=>(
+                  <button key={q} onClick={()=>send(q)} style={{ background:'rgba(0,229,160,.08)',border:'1px solid rgba(0,229,160,.2)',
+                    color:'var(--acc)',padding:'.28rem .6rem',borderRadius:100,fontSize:'.68rem',cursor:'pointer' }}>{q}</button>
+                ))}
+              </div>
+            )}
+          </div>
+
+          {/* Input */}
+          <div style={{ padding:'.7rem .9rem',borderTop:'1px solid var(--bdr)',background:'var(--sur2)',display:'flex',gap:'.5rem' }}>
+            <input className="fi" style={{ flex:1,padding:'.52rem .85rem',fontSize:'.83rem' }}
+              value={inp} onChange={e=>setInp(e.target.value)}
+              onKeyDown={e=>e.key==='Enter'&&send()}
+              placeholder="Type a message..." />
+            <button onClick={()=>send()} disabled={busy||!inp.trim()} style={{
+              background:'var(--acc)',color:'#000',border:'none',width:34,height:34,
+              borderRadius:9,cursor:'pointer',fontSize:'.95rem',flexShrink:0,
+              opacity:busy||!inp.trim()?.5:1,transition:'opacity .2s' }}>➤</button>
+          </div>
+        </div>
+      )}
+    </>
+  );
+}
+
+:root{--bg:#080c14;--sur:#0f1520;--sur2:#161e2e;--bdr:rgba(255,255,255,.07);--acc:#00e5a0;--pur:#7c3aed;--amb:#f59e0b;--txt:#e8edf5;--mut:#6b7a99;--err:#ef4444}
+*,*::before,*::after{box-sizing:border-box;margin:0;padding:0}
+html{scroll-behavior:smooth}
+body{font-family:'DM Sans',sans-serif;background:var(--bg);color:var(--txt);overflow-x:hidden;min-height:100vh}
+h1,h2,h3,h4{font-family:'Syne',sans-serif;font-weight:800}
+a{color:inherit;text-decoration:none}
+input,select,textarea,button{font-family:'DM Sans',sans-serif}
+
+.page{padding-top:72px;min-height:100vh}
+.container{max-width:1200px;margin:0 auto;padding:0 1.5rem}
+
+/* Buttons */
+.btn{display:inline-flex;align-items:center;gap:.45rem;padding:.7rem 1.4rem;border-radius:10px;font-weight:600;font-size:.88rem;border:none;cursor:pointer;transition:all .2s}
+.btn:disabled{opacity:.5;cursor:not-allowed;transform:none!important}
+.btn-primary{background:var(--acc);color:#000;box-shadow:0 0 20px rgba(0,229,160,.2)}
+.btn-primary:hover:not(:disabled){opacity:.85;transform:translateY(-1px)}
+.btn-secondary{background:transparent;color:var(--txt);border:1px solid var(--bdr)}
+.btn-secondary:hover:not(:disabled){border-color:rgba(255,255,255,.18);background:rgba(255,255,255,.04)}
+.btn-purple{background:var(--pur);color:#fff}
+.btn-purple:hover:not(:disabled){opacity:.85}
+.btn-danger{background:var(--err);color:#fff}
+.btn-sm{padding:.42rem .85rem;font-size:.78rem;border-radius:8px}
+.btn-full{width:100%;justify-content:center}
+
+/* Form */
+.fg{display:flex;flex-direction:column;gap:.38rem;margin-bottom:1.1rem}
+.fl{font-size:.8rem;color:var(--mut);font-weight:500}
+.fi,.fs{background:var(--sur2);border:1px solid var(--bdr);border-radius:10px;color:var(--txt);padding:.68rem 1rem;font-size:.88rem;outline:none;width:100%;transition:border-color .2s}
+.fi:focus,.fs:focus{border-color:var(--acc)}
+.fi::placeholder{color:var(--mut)}
+.fs option{background:var(--sur2)}
+.fe{color:var(--err);font-size:.74rem;margin-top:.2rem}
+.f2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media(max-width:580px){.f2{grid-template-columns:1fr}}
+
+/* Cards */
+.card{background:var(--sur);border:1px solid var(--bdr);border-radius:18px;padding:1.5rem;transition:border-color .2s,transform .2s}
+.card:hover{border-color:rgba(255,255,255,.12)}
+
+/* Badges */
+.bdg{display:inline-flex;align-items:center;gap:.28rem;padding:.22rem .6rem;border-radius:100px;font-size:.7rem;font-weight:600}
+.bdg-g{background:rgba(0,229,160,.1);color:var(--acc);border:1px solid rgba(0,229,160,.2)}
+.bdg-p{background:rgba(124,58,237,.1);color:#a78bfa;border:1px solid rgba(124,58,237,.2)}
+.bdg-a{background:rgba(245,158,11,.1);color:var(--amb);border:1px solid rgba(245,158,11,.2)}
+.bdg-r{background:rgba(239,68,68,.1);color:var(--err);border:1px solid rgba(239,68,68,.2)}
+
+/* Modal */
+.mo{position:fixed;inset:0;z-index:500;background:rgba(0,0,0,.82);backdrop-filter:blur(8px);display:flex;align-items:center;justify-content:center;padding:1rem;animation:fi .2s ease}
+.md{background:var(--sur);border:1px solid var(--bdr);border-radius:24px;padding:2rem;width:100%;max-width:480px;position:relative;animation:fu .25s ease}
+.mc{position:absolute;top:1rem;right:1.2rem;background:none;border:none;color:var(--mut);font-size:1.5rem;cursor:pointer;line-height:1}
+
+/* Deal bar */
+.db{height:6px;background:rgba(255,255,255,.07);border-radius:100px;overflow:hidden}
+.df{height:100%;border-radius:100px;transition:width 1s ease}
+
+/* Spinner */
+.spin{width:36px;height:36px;border-radius:50%;border:3px solid rgba(0,229,160,.15);border-top-color:var(--acc);animation:sp .8s linear infinite;margin:0 auto}
+.ls{width:100%;height:100%;display:flex;align-items:center;justify-content:center;padding:4rem}
+
+/* OTP */
+.otp-inp{font-family:monospace;font-size:2rem;font-weight:800;text-align:center;letter-spacing:.35em;background:var(--sur2);border:2px solid var(--acc);border-radius:12px;padding:1rem;color:var(--acc);width:100%;outline:none}
+
+/* Grid */
+.g-auto{display:grid;grid-template-columns:repeat(auto-fill,minmax(290px,1fr));gap:1.1rem}
+.g2{display:grid;grid-template-columns:1fr 1fr;gap:1rem}
+@media(max-width:640px){.g2{grid-template-columns:1fr}}
+.divider{height:1px;background:var(--bdr);margin:1.2rem 0}
+
+/* Animations */
+@keyframes fi{from{opacity:0}to{opacity:1}}
+@keyframes fu{from{opacity:0;transform:translateY(20px)}to{opacity:1;transform:translateY(0)}}
+@keyframes sp{to{transform:rotate(360deg)}}
+@keyframes pulse{0%,100%{opacity:1}50%{opacity:.35}}
+@keyframes blink{0%,100%{opacity:1}50%{opacity:.45}}
+.ani-up{animation:fu .45s ease both}
+.skel{animation:pulse 1.4s ease infinite;background:var(--sur);border-radius:18px;border:1px solid var(--bdr)}
+
+import axios from 'axios';
+
+const BASE = process.env.REACT_APP_API_URL || '/api';
+
+const api = axios.create({ baseURL: BASE, timeout: 15000, headers: { 'Content-Type': 'application/json' } });
+
+api.interceptors.request.use(cfg => {
+  const t = localStorage.getItem('cx_token');
+  if (t) cfg.headers.Authorization = `Bearer ${t}`;
+  return cfg;
+});
+
+api.interceptors.response.use(r => r, async err => {
+  const orig = err.config;
+  if (err.response?.status === 401 && err.response?.data?.code === 'TOKEN_EXPIRED' && !orig._retry) {
+    orig._retry = true;
+    try {
+      const rt = localStorage.getItem('cx_refresh');
+      const { data } = await axios.post(`${BASE}/auth/refresh`, { refreshToken: rt });
+      localStorage.setItem('cx_token', data.accessToken);
+      orig.headers.Authorization = `Bearer ${data.accessToken}`;
+      return api(orig);
+    } catch { localStorage.clear(); window.location.href = '/login'; }
+  }
+  return Promise.reject(err);
+});
+
+export const authAPI = {
+  register: d => api.post('/auth/register', d),
+  login:    d => api.post('/auth/login', d),
+  logout:   () => api.post('/auth/logout'),
+  me:       () => api.get('/auth/me')
+};
+
+export const couponAPI = {
+  list:       p => api.get('/coupons', { params: p }),
+  get:        id => api.get(`/coupons/${id}`),
+  create:     d => api.post('/coupons', d),
+  remove:     id => api.delete(`/coupons/${id}`),
+  myListings: () => api.get('/coupons/my/listings')
+};
+
+export const paymentAPI = {
+  initiate:  id  => api.post('/payments/initiate', { couponId: id }),
+  verifyOTP: (txnId, otp) => api.post('/payments/verify-otp', { txnId, otp }),
+  status:    txnId => api.get(`/payments/status/${txnId}`),
+  history:   () => api.get('/payments/history')
+};
+
+export const chatAPI = {
+  send: (message, history) => api.post('/chat', { message, history })
+};
+
+export default api;
+
+import React from 'react';
+import { BrowserRouter, Routes, Route, Navigate } from 'react-router-dom';
+import { Toaster } from 'react-hot-toast';
+import { AuthProvider, useAuth } from './context/AuthContext';
+import Navbar      from './components/Navbar';
+import ChatWidget  from './components/ChatWidget';
+import Home        from './pages/Home';
+import Login       from './pages/Login';
+import Register    from './pages/Register';
+import Marketplace from './pages/Marketplace';
+import SellCoupon  from './pages/SellCoupon';
+import Dashboard   from './pages/Dashboard';
+import Payment     from './pages/Payment';
+
+const Guard = ({ children, roles }) => {
+  const { user, loading } = useAuth();
+  if (loading) return <div className="ls"><div className="spin"/></div>;
+  if (!user)   return <Navigate to="/login" replace/>;
+  if (roles && !roles.includes(user.role)) return <Navigate to="/" replace/>;
+  return children;
+};
+
+function Inner() {
+  return (
+    <BrowserRouter>
+      <Navbar/>
+      <Routes>
+        <Route path="/"           element={<Home/>}/>
+        <Route path="/login"      element={<Login/>}/>
+        <Route path="/register"   element={<Register/>}/>
+        <Route path="/marketplace"element={<Marketplace/>}/>
+        <Route path="/sell"       element={<Guard roles={['seller','admin']}><SellCoupon/></Guard>}/>
+        <Route path="/dashboard"  element={<Guard><Dashboard/></Guard>}/>
+        <Route path="/payment/*"  element={<Guard roles={['buyer','admin']}><Payment/></Guard>}/>
+        <Route path="*"           element={<Navigate to="/" replace/>}/>
+      </Routes>
+      <ChatWidget/>
+      <Toaster position="bottom-right" toastOptions={{
+        style:{ background:'var(--sur)',color:'var(--txt)',border:'1px solid var(--bdr)' },
+        success:{ iconTheme:{ primary:'var(--acc)',secondary:'#000' } }
+      }}/>
+    </BrowserRouter>
+  );
+}
+
+export default function App() {
+  return <AuthProvider><Inner/></AuthProvider>;
+}
+
+import React from 'react';
+import ReactDOM from 'react-dom/client';
+import './index.css';
+import App from './App';
+
+ReactDOM.createRoot(document.getElementById('root')).render(<React.StrictMode><App /></React.StrictMode>);
+
+import React, { useState, useEffect, useCallback } from 'react';
+import { useSearchParams, useNavigate } from 'react-router-dom';
+import { paymentAPI } from '../services/api';
+import toast from 'react-hot-toast';
+
+const STEPS = [
+  { key:'payment',    label:'Payment',   icon:'💳' },
+  { key:'escrow',     label:'Escrow',    icon:'🔒' },
+  { key:'validate',   label:'Validate',  icon:'🤖' },
+  { key:'otp',        label:'OTP',       icon:'📱' },
+  { key:'done',       label:'Complete',  icon:'✅' },
+];
+
+const escrowToStep = {
+  awaiting_payment: 0, payment_received: 1,
+  validating: 2, otp_pending: 3, released: 4, aborted: -1
+};
+
+export default function Payment() {
+  const [sp] = useSearchParams();
+  const nav  = useNavigate();
+  const txnId = sp.get('txn');
+  const isFailed = window.location.pathname.includes('failed');
+
+  const [txn,      setTxn]      = useState(null);
+  const [otp,      setOtp]      = useState('');
+  const [revealed, setRevealed] = useState(null);
+  const [loading,  setLoading]  = useState(false);
+  const [err,      setErr]      = useState('');
+  const [stepIdx,  setStepIdx]  = useState(0);
+
+  const poll = useCallback(async () => {
+    if (!txnId) return;
+    try {
+      const r = await paymentAPI.status(txnId);
+      const d = r.data.data;
+      setTxn(d);
+      const idx = escrowToStep[d.escrowStatus] ?? 0;
+      setStepIdx(idx);
+    } catch { /* silent */ }
+  }, [txnId]);
+
+  useEffect(() => {
+    poll();
+    const t = setInterval(poll, 3000);
+    return () => clearInterval(t);
+  }, [poll]);
+
+  const verify = async () => {
+    if (otp.length !== 6) { setErr('Enter the 6-digit OTP'); return; }
+    setLoading(true); setErr('');
+    try {
+      const r = await paymentAPI.verifyOTP(txnId, otp);
+      setRevealed(r.data.data);
+      setStepIdx(4);
+      toast.success('🎉 Coupon unlocked!');
+    } catch (e) {
+      const msg = e.response?.data?.message || 'OTP verification failed';
+      setErr(msg);
+      toast.error(msg);
+    } finally { setLoading(false); }
+  };
+
+  if (!txnId) return (
+    <div className="page" style={{ display:'flex', alignItems:'center', justifyContent:'center' }}>
+      <div className="card" style={{ textAlign:'center', maxWidth:400 }}>
+        <div style={{ fontSize:'3rem', marginBottom:'1rem' }}>❌</div>
+        <h2>Invalid Transaction</h2>
+        <p style={{ color:'var(--mut)', margin:'.5rem 0 1.5rem' }}>No transaction ID found in this URL.</p>
+        <button className="btn btn-primary btn-full" onClick={() => nav('/marketplace')}>Browse Coupons</button>
+      </div>
+    </div>
+  );
+
+  const isAborted  = txn?.status === 'refunded' || txn?.escrow?.status === 'aborted';
+  const isComplete = txn?.status === 'completed' || revealed;
+
+  return (
+    <div className="page" style={{ display:'flex', alignItems:'center', justifyContent:'center', padding:'2rem' }}>
+      <div style={{ width:'100%', maxWidth:560 }}>
+        <div style={{ marginBottom:'1.5rem' }}>
+          <h1 style={{ fontSize:'1.8rem', marginBottom:'.3rem' }}>Transaction Status</h1>
+          <p style={{ color:'var(--mut)', fontSize:'.82rem' }}>
+            ID: <code style={{ color:'var(--acc)', fontSize:'.8rem' }}>{txnId}</code>
+          </p>
+        </div>
+
+        {/* Step tracker */}
+        <div className="card" style={{ marginBottom:'1.5rem' }}>
+          <div style={{ display:'flex', justifyContent:'space-between', alignItems:'flex-start' }}>
+            {STEPS.map((s, i) => {
+              const done    = isAborted ? false : i < stepIdx;
+              const active  = isAborted ? false : i === stepIdx;
+              const failed  = isAborted && i <= 2;
+              const color   = failed ? '#ef4444' : done ? '#00e5a0' : active ? '#f59e0b' : '#6b7a99';
+              return (
+                <div key={s.key} style={{ display:'flex', flexDirection:'column', alignItems:'center', gap:'.35rem', flex:1 }}>
+                  <div style={{
+                    width:34, height:34, borderRadius:'50%', background:color,
+                    display:'flex', alignItems:'center', justifyContent:'center',
+                    fontSize:'.85rem', fontWeight:700,
+                    color: (done || active) && !failed ? '#000' : '#fff',
+                    transition:'all .4s', boxShadow: active ? `0 0 14px ${color}66` : 'none'
+                  }}>
+                    {failed ? '✕' : done ? '✓' : active ? '…' : s.icon}
+                  </div>
+                  <span style={{ fontSize:'.65rem', color, fontWeight:600, textAlign:'center' }}>{s.label}</span>
+                </div>
+              );
+            })}
+          </div>
+          {/* Progress bar */}
+          <div style={{ height:4, background:'var(--sur2)', borderRadius:4, marginTop:'1rem', overflow:'hidden' }}>
+            <div style={{
+              height:'100%', borderRadius:4,
+              background: isAborted ? 'var(--err)' : 'linear-gradient(90deg, var(--acc), #00b4ff)',
+              width: isAborted ? '40%' : `${(stepIdx / (STEPS.length - 1)) * 100}%`,
+              transition:'width .5s ease'
+            }}/>
+          </div>
+        </div>
+
+        {/* Txn info */}
+        {txn && (
+          <div className="card" style={{ marginBottom:'1.5rem' }}>
+            {[
+              ['Coupon',        txn.coupon?.brand || '—'],
+              ['Amount Paid',   `₹${txn.amount}`],
+              ['Payment',       txn.paymentStatus],
+              ['Escrow Status', (txn.escrowStatus || '').replace(/_/g,' ')],
+            ].map(([k,v]) => (
+              <div key={k} style={{ display:'flex', justifyContent:'space-between', marginBottom:'.55rem', fontSize:'.85rem' }}>
+                <span style={{ color:'var(--mut)' }}>{k}</span>
+                <span style={{ fontWeight:600, color: k==='Amount Paid' ? 'var(--acc)' : 'var(--txt)', textTransform:'capitalize' }}>{v}</span>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {/* ── ABORTED / REFUNDED ── */}
+        {isAborted && (
+          <div className="card" style={{ borderColor:'rgba(239,68,68,.3)', textAlign:'center', padding:'2rem', marginBottom:'1.5rem' }}>
+            <div style={{ fontSize:'3rem', marginBottom:'.8rem' }}>💸</div>
+            <h3 style={{ color:'var(--err)', marginBottom:'.5rem' }}>Transaction Aborted — Refund Initiated</h3>
+            <p style={{ color:'var(--mut)', fontSize:'.87rem', lineHeight:1.6 }}>
+              Coupon validation failed or too many incorrect OTP attempts.<br/>
+              <strong style={{ color:'var(--txt)' }}>₹{txn?.amount}</strong> will be refunded to your original payment method within <strong style={{ color:'var(--txt)' }}>3–5 business days</strong>.
+            </p>
+            <button className="btn btn-secondary" style={{ marginTop:'1.5rem' }} onClick={() => nav('/marketplace')}>
+              Browse Other Coupons
+            </button>
+          </div>
+        )}
+
+        {/* ── OTP ENTRY ── */}
+        {!isAborted && !revealed && txn?.escrowStatus === 'otp_pending' && (
+          <div className="card" style={{ borderColor:'rgba(0,229,160,.25)', marginBottom:'1.5rem' }}>
+            <div style={{ textAlign:'center', marginBottom:'1.5rem' }}>
+              <div style={{ fontSize:'2.5rem', marginBottom:'.5rem' }}>📱</div>
+              <h3 style={{ marginBottom:'.4rem' }}>Enter OTP to Claim Coupon</h3>
+              <p style={{ color:'var(--mut)', fontSize:'.85rem', lineHeight:1.55 }}>
+                A 6-digit OTP was sent to your registered phone/email.<br/>
+                Enter it below to decrypt and reveal your coupon code.
+              </p>
+            </div>
+
+            <input
+              className="otp-inp"
+              type="text" inputMode="numeric" maxLength={6}
+              value={otp} onChange={e => setOtp(e.target.value.replace(/\D/g,''))}
+              onKeyDown={e => e.key === 'Enter' && verify()}
+              placeholder="000000"
+            />
+
+            {err && (
+              <p style={{ color:'var(--err)', fontSize:'.82rem', textAlign:'center', marginTop:'.6rem' }}>{err}</p>
+            )}
+
+            <button className="btn btn-primary btn-full" style={{ marginTop:'1rem' }}
+              onClick={verify} disabled={loading || otp.length !== 6}>
+              {loading ? 'Verifying…' : '🔓 Verify & Reveal Coupon'}
+            </button>
+
+            <div style={{ display:'flex', justifyContent:'space-between', marginTop:'.75rem', fontSize:'.72rem', color:'var(--mut)' }}>
+              <span>⏱ OTP expires in 10 minutes</span>
+              <span>Max 3 attempts — then auto-refund</span>
+            </div>
+          </div>
+        )}
+
+        {/* ── COUPON REVEALED ── */}
+        {revealed && (
+          <div className="card" style={{ borderColor:'rgba(0,229,160,.4)', background:'rgba(0,229,160,.04)', textAlign:'center' }}>
+            <div style={{ fontSize:'3rem', marginBottom:'.6rem' }}>🎉</div>
+            <h3 style={{ color:'var(--acc)', marginBottom:'.4rem' }}>Coupon Unlocked!</h3>
+            <p style={{ color:'var(--mut)', fontSize:'.85rem', marginBottom:'1.4rem', lineHeight:1.55 }}>
+              Payment released to seller. Your verified coupon code is below — use it before it expires!
+            </p>
+
+            <div style={{
+              background:'var(--sur2)', border:'2px solid var(--acc)',
+              borderRadius:14, padding:'1.2rem', marginBottom:'1rem'
+            }}>
+              <div style={{ fontSize:'.72rem', color:'var(--mut)', marginBottom:'.4rem', letterSpacing:'.08em' }}>YOUR COUPON CODE</div>
+              <div style={{ fontFamily:'monospace', fontSize:'2rem', fontWeight:800, color:'var(--acc)', letterSpacing:'.2em' }}>
+                {revealed.couponCode}
+              </div>
+              <div style={{ fontSize:'.75rem', color:'var(--mut)', marginTop:'.4rem' }}>
+                {revealed.brand} · Expires {new Date(revealed.expiryDate).toLocaleDateString('en-IN')}
+              </div>
+            </div>
+
+            <button className="btn btn-secondary btn-full"
+              onClick={() => { navigator.clipboard.writeText(revealed.couponCode); toast.success('Copied!'); }}>
+              📋 Copy Code
+            </button>
+
+            {revealed.terms && (
+              <p style={{ fontSize:'.73rem', color:'var(--mut)', marginTop:'1rem', lineHeight:1.5 }}>
+                <strong>T&C:</strong> {revealed.terms}
+              </p>
+            )}
+          </div>
+        )}
+
+        {/* ── WAITING STATE ── */}
+        {!isAborted && !revealed && txn && !['otp_pending','released'].includes(txn.escrowStatus) && (
+          <div className="card" style={{ textAlign:'center', padding:'2rem' }}>
+            <div className="spin" style={{ marginBottom:'1rem' }}/>
+            <h3 style={{ marginBottom:'.4rem' }}>
+              {txn.escrowStatus === 'awaiting_payment' && 'Waiting for payment…'}
+              {txn.escrowStatus === 'payment_received' && 'Payment received! Validating coupon…'}
+              {txn.escrowStatus === 'validating'       && 'AI validating coupon authenticity…'}
+            </h3>
+            <p style={{ color:'var(--mut)', fontSize:'.85rem' }}>This page auto-updates every 3 seconds</p>
+          </div>
+        )}
+
+        {/* Failed redirect */}
+        {isFailed && !txn && (
+          <div className="card" style={{ textAlign:'center', padding:'2rem', borderColor:'rgba(239,68,68,.3)' }}>
+            <div style={{ fontSize:'3rem', marginBottom:'.8rem' }}>❌</div>
+            <h3 style={{ color:'var(--err)', marginBottom:'.5rem' }}>Payment Failed</h3>
+            <p style={{ color:'var(--mut)', fontSize:'.87rem', marginBottom:'1.5rem' }}>
+              Your payment was not completed. No money was charged.
+            </p>
+            <button className="btn btn-primary btn-full" onClick={() => nav('/marketplace')}>Try Again</button>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+import React, { useState } from 'react';
+import { Link, useNavigate } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import toast from 'react-hot-toast';
+
+export default function Login() {
+  const { login } = useAuth();
+  const nav = useNavigate();
+  const [form, setForm] = useState({ email: '', password: '' });
+  const [err, setErr]   = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const set = k => e => setForm(f => ({ ...f, [k]: e.target.value }));
+
+  const submit = async e => {
+    e.preventDefault();
+    setErr(''); setBusy(true);
+    try {
+      const u = await login(form.email, form.password);
+      toast.success(`Welcome back, ${u.name.split(' ')[0]}!`);
+      nav(u.role === 'seller' ? '/dashboard' : '/marketplace');
+    } catch (e) {
+      setErr(e.response?.data?.message || 'Login failed. Check credentials.');
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="page" style={{ display:'flex',alignItems:'center',justifyContent:'center',padding:'2rem' }}>
+      <div style={{ width:'100%',maxWidth:420 }}>
+        <div style={{ textAlign:'center',marginBottom:'2rem' }}>
+          <h1 style={{ fontSize:'2rem',marginBottom:'.4rem' }}>Welcome Back</h1>
+          <p style={{ color:'var(--mut)' }}>Log in to your CouponX account</p>
+        </div>
+
+        {/* Demo creds */}
+        <div style={{ background:'rgba(0,229,160,.07)',border:'1px solid rgba(0,229,160,.2)',
+          borderRadius:12,padding:'1rem',marginBottom:'1.5rem',fontSize:'.8rem' }}>
+          <div style={{ fontWeight:600,marginBottom:'.4rem',color:'var(--acc)' }}>🎭 Demo Credentials</div>
+          <div style={{ color:'var(--mut)',lineHeight:1.8 }}>
+            Buyer: <code style={{ color:'var(--txt)' }}>buyer@couponx.demo</code> / <code style={{ color:'var(--txt)' }}>Buyer@123</code><br/>
+            Seller: <code style={{ color:'var(--txt)' }}>seller@couponx.demo</code> / <code style={{ color:'var(--txt)' }}>Seller@123</code>
+          </div>
+        </div>
+
+        <form onSubmit={submit} className="card">
+          {err && <div style={{ background:'rgba(239,68,68,.1)',border:'1px solid rgba(239,68,68,.25)',
+            color:'var(--err)',padding:'.7rem 1rem',borderRadius:10,marginBottom:'1rem',fontSize:'.85rem' }}>{err}</div>}
+
+          <div className="fg">
+            <label className="fl">Email</label>
+            <input className="fi" type="email" placeholder="you@example.com" value={form.email} onChange={set('email')} required/>
+          </div>
+          <div className="fg">
+            <label className="fl">Password</label>
+            <input className="fi" type="password" placeholder="••••••••" value={form.password} onChange={set('password')} required/>
+          </div>
+
+          <button className="btn btn-primary btn-full" type="submit" disabled={busy} style={{ marginTop:'.5rem' }}>
+            {busy ? 'Signing in...' : 'Sign In →'}
+          </button>
+
+          <p style={{ textAlign:'center',marginTop:'1.2rem',fontSize:'.85rem',color:'var(--mut)' }}>
+            No account? <Link to="/register" style={{ color:'var(--acc)' }}>Create one free</Link>
+          </p>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+import React from 'react';
+import { Link } from 'react-router-dom';
+
+const stats = [['₹4.2B','Lost Annually to Expiry'],['340M+','Coupons Wasted/Year'],['98%','Fraud Detection Rate'],['AES-256','Encryption Standard']];
+const steps = [
+  { icon:'📋', n:'01', t:'Seller Lists',    d:'Seller submits coupon. AI instantly validates and scores it. Fraudulent coupons are flagged before going live.' },
+  { icon:'🔐', n:'02', t:'Code Encrypted',  d:'Coupon code encrypted with AES-256 immediately on submission. Even admins cannot read it without completing the escrow.' },
+  { icon:'💰', n:'03', t:'Escrow Payment',  d:'Buyer pays via JusPay. Funds are held in escrow — no money moves until the full process completes.' },
+  { icon:'✅', n:'04', t:'Coupon Validated', d:'AI + system validates the coupon is still live and unused. If validation fails, escrow is aborted and buyer auto-refunded.' },
+  { icon:'📱', n:'05', t:'OTP Transfer',    d:'6-digit OTP sent to buyer. On correct entry, the real coupon code is decrypted and revealed — nowhere else.' },
+  { icon:'⭐', n:'06', t:'Money Released',  d:'Seller receives payment. Both parties rate each other, building a transparent trust network.' },
+];
+
+export default function Home() {
+  return (
+    <div className="page" style={{ paddingTop:0 }}>
+      {/* Hero */}
+      <div style={{ minHeight:'100vh',display:'flex',flexDirection:'column',alignItems:'center',
+        justifyContent:'center',textAlign:'center',padding:'7rem 1.5rem 4rem',position:'relative',overflow:'hidden' }}>
+        <div style={{ position:'absolute',inset:0,pointerEvents:'none',
+          background:'radial-gradient(ellipse 60% 50% at 50% 10%,rgba(0,229,160,.12) 0%,transparent 70%),' +
+          'radial-gradient(ellipse 40% 40% at 80% 80%,rgba(124,58,237,.1) 0%,transparent 60%)' }}/>
+
+        <div style={{ display:'inline-flex',alignItems:'center',gap:'.5rem',
+          background:'rgba(0,229,160,.1)',border:'1px solid rgba(0,229,160,.25)',
+          color:'var(--acc)',padding:'.3rem 1rem',borderRadius:100,fontSize:'.78rem',fontWeight:500,marginBottom:'1.4rem' }}>
+          <span style={{ width:6,height:6,background:'var(--acc)',borderRadius:'50%',animation:'pulse 1.5s ease infinite' }}/>
+          AI-Powered · Escrow-Protected · AES-256 Encrypted
+        </div>
+
+        <h1 style={{ fontSize:'clamp(2.6rem,7vw,5.2rem)',lineHeight:1.06,marginBottom:'1.1rem' }}>
+          Turn Unused Coupons<br/>Into <span style={{ color:'var(--acc)' }}>Real Money</span>
+        </h1>
+        <p style={{ color:'var(--mut)',fontSize:'clamp(.95rem,2vw,1.15rem)',maxWidth:580,lineHeight:1.7,marginBottom:'2.5rem' }}>
+          CouponX is a secured peer-to-peer coupon marketplace. Every code is encrypted at rest,
+          payment is held in escrow, and the real coupon is only revealed after OTP verification.
+        </p>
+
+        <div style={{ display:'flex',gap:'1rem',flexWrap:'wrap',justifyContent:'center',marginBottom:'3rem' }}>
+          <Link to="/marketplace" className="btn btn-primary" style={{ padding:'.85rem 2rem',fontSize:'1rem' }}>🛒 Browse Coupons</Link>
+          <Link to="/register"    className="btn btn-secondary" style={{ padding:'.85rem 2rem',fontSize:'1rem' }}>💰 Start Selling</Link>
+        </div>
+
+        <div style={{ display:'flex',gap:'2.5rem',flexWrap:'wrap',justifyContent:'center' }}>
+          {stats.map(([n,l])=>(
+            <div key={l} style={{ textAlign:'center' }}>
+              <div style={{ fontFamily:'Syne,sans-serif',fontSize:'1.9rem',fontWeight:800,color:'var(--acc)' }}>{n}</div>
+              <div style={{ color:'var(--mut)',fontSize:'.75rem',marginTop:'.18rem' }}>{l}</div>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* How it works */}
+      <div style={{ padding:'5rem 1.5rem',maxWidth:1200,margin:'0 auto' }}>
+        <div style={{ textAlign:'center',marginBottom:'3rem' }}>
+          <div className="bdg bdg-g" style={{ marginBottom:'.75rem' }}>HOW IT WORKS</div>
+          <h2 style={{ fontSize:'clamp(1.8rem,4vw,2.8rem)',marginBottom:'.8rem' }}>Verified. Safe. Smart.</h2>
+          <p style={{ color:'var(--mut)',maxWidth:520,margin:'0 auto',lineHeight:1.7 }}>
+            Every transaction goes through a 6-step escrow pipeline. No one gets scammed — period.
+          </p>
+        </div>
+        <div style={{ display:'grid',gridTemplateColumns:'repeat(auto-fit,minmax(260px,1fr))',gap:'1.2rem' }}>
+          {steps.map(s=>(
+            <div key={s.n} className="card" style={{ position:'relative' }}
+              onMouseEnter={e=>e.currentTarget.style.transform='translateY(-4px)'}
+              onMouseLeave={e=>e.currentTarget.style.transform=''}>
+              <div style={{ position:'absolute',top:'.9rem',right:'1.1rem',fontFamily:'Syne,sans-serif',
+                fontSize:'2.5rem',fontWeight:800,color:'rgba(0,229,160,.12)' }}>{s.n}</div>
+              <div style={{ fontSize:'1.6rem',marginBottom:'.9rem' }}>{s.icon}</div>
+              <h3 style={{ fontSize:'1rem',marginBottom:'.45rem' }}>{s.t}</h3>
+              <p style={{ color:'var(--mut)',fontSize:'.83rem',lineHeight:1.6 }}>{s.d}</p>
+            </div>
+          ))}
+        </div>
+      </div>
+
+      {/* CTA */}
+      <div style={{ padding:'4rem 1.5rem',textAlign:'center' }}>
+        <div className="card" style={{ maxWidth:560,margin:'0 auto',background:'linear-gradient(135deg,rgba(0,229,160,.07),rgba(124,58,237,.07))',borderColor:'rgba(0,229,160,.2)' }}>
+          <h2 style={{ fontSize:'1.8rem',marginBottom:'.75rem' }}>Ready to Start?</h2>
+          <p style={{ color:'var(--mut)',marginBottom:'1.8rem',lineHeight:1.6 }}>
+            Join thousands of users buying and selling verified coupons safely.
+          </p>
+          <div style={{ display:'flex',gap:'1rem',justifyContent:'center',flexWrap:'wrap' }}>
+            <Link to="/register?role=buyer"  className="btn btn-primary">Join as Buyer</Link>
+            <Link to="/register?role=seller" className="btn btn-secondary">Join as Seller</Link>
+          </div>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+import React, { useState } from 'react';
+import { couponAPI } from '../services/api';
+import toast from 'react-hot-toast';
+
+const CATS = ['food','shopping','travel','health','entertainment','other'];
+
+export default function SellCoupon() {
+  const today = new Date(); today.setDate(today.getDate() + 3);
+  const minDate = today.toISOString().split('T')[0];
+
+  const [form, setForm] = useState({
+    brand:'', category:'food', description:'', couponCode:'',
+    faceValue:'', salePrice:'', minOrder:'', expiryDate:'', terms:'', applicableOn:''
+  });
+  const [busy, setBusy]     = useState(false);
+  const [success, setSuccess] = useState(null);
+  const [err, setErr]       = useState('');
+
+  const set = k => e => setForm(f => ({ ...f, [k]: e.target.value }));
+
+  const savPct = form.faceValue && form.salePrice
+    ? Math.round(((form.faceValue - form.salePrice) / form.faceValue) * 100)
+    : null;
+
+  const submit = async e => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    if (Number(form.salePrice) >= Number(form.faceValue)) {
+      setErr('Sale price must be less than face value'); setBusy(false); return;
+    }
+    try {
+      const r = await couponAPI.create(form);
+      setSuccess(r.data.data);
+      toast.success('Coupon listed! AI validation underway.');
+      setForm({ brand:'', category:'food', description:'', couponCode:'', faceValue:'', salePrice:'', minOrder:'', expiryDate:'', terms:'', applicableOn:'' });
+    } catch (e) {
+      setErr(e.response?.data?.message || e.response?.data?.errors?.[0]?.msg || 'Failed to list coupon');
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="page">
+      <div className="container" style={{ paddingTop:'2rem', paddingBottom:'4rem', maxWidth:680 }}>
+        <div style={{ marginBottom:'2rem' }}>
+          <div className="bdg bdg-a" style={{ marginBottom:'.6rem' }}>SELL COUPON</div>
+          <h1 style={{ fontSize:'clamp(1.8rem,4vw,2.6rem)', marginBottom:'.4rem' }}>List Your Coupon</h1>
+          <p style={{ color:'var(--mut)', fontSize:'.9rem' }}>
+            Your coupon code is <strong style={{ color:'var(--acc)' }}>AES-256 encrypted</strong> immediately on submission.
+            It is never readable — not even by admins — until the buyer completes OTP verification.
+          </p>
+        </div>
+
+        {success && (
+          <div style={{ background:'rgba(0,229,160,.08)', border:'1px solid rgba(0,229,160,.25)',
+            borderRadius:14, padding:'1.2rem', marginBottom:'1.5rem' }}>
+            <div style={{ fontWeight:700, color:'var(--acc)', marginBottom:'.4rem' }}>✅ Coupon Listed Successfully!</div>
+            <div style={{ fontSize:'.85rem', color:'var(--mut)' }}>
+              <strong>{success.brand}</strong> — masked as <code style={{ color:'var(--txt)' }}>{success.maskedCode}</code><br/>
+              AI validation is running in the background. Your coupon will go live within seconds.
+            </div>
+          </div>
+        )}
+
+        <form onSubmit={submit} className="card">
+          {err && (
+            <div style={{ background:'rgba(239,68,68,.1)', border:'1px solid rgba(239,68,68,.25)',
+              color:'var(--err)', padding:'.7rem 1rem', borderRadius:10, marginBottom:'1rem', fontSize:'.85rem' }}>{err}</div>
+          )}
+
+          <div className="f2">
+            <div className="fg">
+              <label className="fl">Brand / Platform *</label>
+              <input className="fi" placeholder="e.g. Swiggy, Amazon…" value={form.brand} onChange={set('brand')} required />
+            </div>
+            <div className="fg">
+              <label className="fl">Category *</label>
+              <select className="fs" value={form.category} onChange={set('category')}>
+                {CATS.map(c => <option key={c} value={c}>{c.charAt(0).toUpperCase() + c.slice(1)}</option>)}
+              </select>
+            </div>
+          </div>
+
+          <div className="fg">
+            <label className="fl">Description *</label>
+            <input className="fi" placeholder="e.g. ₹300 off on orders above ₹699" value={form.description} onChange={set('description')} required maxLength={500}/>
+          </div>
+
+          <div className="fg">
+            <label className="fl">Coupon Code * <span style={{ color:'var(--acc)', fontSize:'.7rem' }}>(🔒 encrypted on submission)</span></label>
+            <input className="fi" placeholder="e.g. SAVE300OFF" value={form.couponCode} onChange={set('couponCode')} required style={{ fontFamily:'monospace', letterSpacing:'.08em' }}/>
+          </div>
+
+          <div className="f2">
+            <div className="fg">
+              <label className="fl">Face Value ₹ *</label>
+              <input className="fi" type="number" min={1} placeholder="e.g. 500" value={form.faceValue} onChange={set('faceValue')} required/>
+            </div>
+            <div className="fg">
+              <label className="fl">Your Asking Price ₹ *
+                {savPct !== null && savPct > 0 && <span style={{ color:'var(--acc)', marginLeft:'.4rem' }}>({savPct}% savings for buyer)</span>}
+              </label>
+              <input className="fi" type="number" min={1} placeholder="e.g. 199" value={form.salePrice} onChange={set('salePrice')} required/>
+            </div>
+          </div>
+
+          <div className="f2">
+            <div className="fg">
+              <label className="fl">Min. Order Value ₹</label>
+              <input className="fi" type="number" min={0} placeholder="0 = No minimum" value={form.minOrder} onChange={set('minOrder')}/>
+            </div>
+            <div className="fg">
+              <label className="fl">Expiry Date *</label>
+              <input className="fi" type="date" min={minDate} value={form.expiryDate} onChange={set('expiryDate')} required/>
+            </div>
+          </div>
+
+          <div className="fg">
+            <label className="fl">Applicable On</label>
+            <input className="fi" placeholder="e.g. App only, first order, specific categories" value={form.applicableOn} onChange={set('applicableOn')}/>
+          </div>
+
+          <div className="fg">
+            <label className="fl">Terms & Conditions</label>
+            <input className="fi" placeholder="e.g. Cannot be clubbed with other offers" value={form.terms} onChange={set('terms')}/>
+          </div>
+
+          {/* Fee info */}
+          <div style={{ background:'var(--sur2)', borderRadius:10, padding:'1rem', marginBottom:'1rem', fontSize:'.82rem', color:'var(--mut)' }}>
+            💡 <strong style={{ color:'var(--txt)' }}>Platform fee:</strong> 5% deducted from your asking price on successful sale.
+            {form.salePrice && <span style={{ color:'var(--acc)', marginLeft:'.4rem' }}>You receive ₹{Math.round(form.salePrice * 0.95)} after fee.</span>}
+          </div>
+
+          <button className="btn btn-primary btn-full" type="submit" disabled={busy}>
+            {busy ? '🤖 Encrypting & Listing…' : '🔐 Encrypt & List Coupon →'}
+          </button>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+import React, { useState, useEffect, useCallback } from 'react';
+import { couponAPI, paymentAPI } from '../services/api';
+import CouponCard from '../components/CouponCard';
+import { useNavigate } from 'react-router-dom';
+import toast from 'react-hot-toast';
+
+const CATS = [
+  { v:'', l:'All' },
+  { v:'food', l:'🍕 Food' },
+  { v:'shopping', l:'🛍 Shopping' },
+  { v:'travel', l:'✈️ Travel' },
+  { v:'health', l:'💊 Health' },
+  { v:'entertainment', l:'🎬 Entertainment' },
+];
+
+export default function Marketplace() {
+  const [coupons, setCoupons] = useState([]);
+  const [loading, setLoading] = useState(true);
+  const [cat, setCat]         = useState('');
+  const [q, setQ]             = useState('');
+  const [sort, setSort]       = useState('-createdAt');
+  const [modal, setModal]     = useState(null);
+  const [buying, setBuying]   = useState(false);
+  const nav = useNavigate();
+
+  const fetch = useCallback(async () => {
+    setLoading(true);
+    try {
+      const r = await couponAPI.list({ category: cat || undefined, sort, q: q || undefined });
+      setCoupons(r.data.data);
+    } catch { toast.error('Failed to load coupons'); }
+    finally { setLoading(false); }
+  }, [cat, sort, q]);
+
+  useEffect(() => { const t = setTimeout(fetch, 350); return () => clearTimeout(t); }, [fetch]);
+
+  const confirmBuy = async () => {
+    setBuying(true);
+    try {
+      const r = await paymentAPI.initiate(modal._id);
+      const { txnId, paymentUrl } = r.data.data;
+      toast.success('Payment session created!');
+      // In prod open paymentUrl in same tab for JusPay hosted page
+      // For demo we navigate directly to payment flow
+      nav(`/payment/processing?txn=${txnId}`);
+    } catch (e) {
+      toast.error(e.response?.data?.message || 'Could not initiate payment');
+    } finally { setBuying(false); setModal(null); }
+  };
+
+  return (
+    <div className="page">
+      <div className="container" style={{ paddingTop:'2rem', paddingBottom:'4rem' }}>
+        {/* Header */}
+        <div style={{ marginBottom:'2rem' }}>
+          <div className="bdg bdg-g" style={{ marginBottom:'.6rem' }}>LIVE MARKETPLACE</div>
+          <h1 style={{ fontSize:'clamp(1.8rem,4vw,2.8rem)', marginBottom:'.4rem' }}>Buy Verified Coupons</h1>
+          <p style={{ color:'var(--mut)', fontSize:'.9rem' }}>AI-validated · Escrow-protected · Code hidden until OTP verified</p>
+        </div>
+
+        {/* Filters */}
+        <div style={{ display:'flex', gap:'.75rem', flexWrap:'wrap', marginBottom:'1.5rem', alignItems:'center' }}>
+          <input className="fi" style={{ width:220, flex:'none' }}
+            placeholder="🔍 Search brand or description…"
+            value={q} onChange={e => setQ(e.target.value)} />
+
+          <div style={{ display:'flex', gap:'.45rem', flexWrap:'wrap' }}>
+            {CATS.map(c => (
+              <button key={c.v} className="btn btn-sm"
+                onClick={() => setCat(c.v)}
+                style={{
+                  background: cat === c.v ? 'var(--pur)' : 'transparent',
+                  color: cat === c.v ? '#fff' : 'var(--mut)',
+                  border: `1px solid ${cat === c.v ? 'var(--pur)' : 'var(--bdr)'}`,
+                }}>{c.l}</button>
+            ))}
+          </div>
+
+          <select className="fs" style={{ width:170, flex:'none' }} value={sort} onChange={e => setSort(e.target.value)}>
+            <option value="-createdAt">Newest First</option>
+            <option value="salePrice">Price: Low → High</option>
+            <option value="-salePrice">Price: High → Low</option>
+            <option value="-ai.score">Best Deal First</option>
+            <option value="expiryDate">Expiring Soon</option>
+          </select>
+        </div>
+
+        {/* Grid */}
+        {loading ? (
+          <div className="g-auto">
+            {[...Array(6)].map((_, i) => <div key={i} className="skel" style={{ height:360 }} />)}
+          </div>
+        ) : coupons.length === 0 ? (
+          <div style={{ textAlign:'center', padding:'5rem', color:'var(--mut)' }}>
+            <div style={{ fontSize:'3rem', marginBottom:'1rem' }}>🎫</div>
+            <p>No coupons found. Try adjusting your filters.</p>
+          </div>
+        ) : (
+          <div className="g-auto">
+            {coupons.map(c => <CouponCard key={c._id} c={c} onBuy={setModal} />)}
+          </div>
+        )}
+      </div>
+
+      {/* Buy Modal */}
+      {modal && (
+        <div className="mo" onClick={e => e.target === e.currentTarget && setModal(null)}>
+          <div className="md">
+            <button className="mc" onClick={() => setModal(null)}>×</button>
+            <div style={{ textAlign:'center', marginBottom:'1.4rem' }}>
+              <div style={{ fontSize:'2.5rem', marginBottom:'.4rem' }}>🛒</div>
+              <h3 style={{ fontSize:'1.3rem' }}>Confirm Purchase</h3>
+            </div>
+
+            <div style={{ background:'var(--sur2)', borderRadius:12, padding:'1rem', marginBottom:'1.2rem' }}>
+              {[
+                ['Brand',       modal.brand],
+                ['Coupon Value', `₹${modal.faceValue}`],
+                ['You Pay',      `₹${modal.salePrice}`],
+                ['You Save',     `₹${modal.faceValue - modal.salePrice} (${modal.savingPct ?? Math.round(((modal.faceValue - modal.salePrice)/modal.faceValue)*100)}%)`],
+              ].map(([k,v]) => (
+                <div key={k} style={{ display:'flex', justifyContent:'space-between', marginBottom:'.5rem', fontSize:'.88rem' }}>
+                  <span style={{ color:'var(--mut)' }}>{k}</span>
+                  <strong style={{ color: k === 'You Pay' ? 'var(--acc)' : 'var(--txt)' }}>{v}</strong>
+                </div>
+              ))}
+              <div className="divider" />
+              <div style={{ fontSize:'.78rem', color:'var(--mut)', lineHeight:1.6 }}>
+                🔒 Your payment is held in <strong>escrow</strong>. Coupon code revealed only after AI validation + your OTP. If validation fails, you are <strong>automatically refunded</strong>.
+              </div>
+            </div>
+
+            <div style={{ display:'flex', gap:'.75rem' }}>
+              <button className="btn btn-secondary" style={{ flex:1, justifyContent:'center' }} onClick={() => setModal(null)}>Cancel</button>
+              <button className="btn btn-primary"   style={{ flex:1, justifyContent:'center' }} onClick={confirmBuy} disabled={buying}>
+                {buying ? 'Processing…' : `🔒 Pay ₹${modal.salePrice}`}
+              </button>
+            </div>
+          </div>
+        </div>
+      )}
+    </div>
+  );
+}
+
+import React, { useState, useEffect } from 'react';
+import { paymentAPI, couponAPI } from '../services/api';
+import { useAuth } from '../context/AuthContext';
+import { useNavigate } from 'react-router-dom';
+import toast from 'react-hot-toast';
+
+const statusColor = s => ({
+  completed:'var(--acc)', refunded:'var(--amb)', failed:'var(--err)',
+  in_escrow:'#00b4ff', payment_pending:'var(--amb)', initiated:'var(--mut)'
+}[s] || 'var(--mut)');
+
+const couponStatusColor = s => ({
+  active:'var(--acc)', sold:'var(--pur)', reserved:'var(--amb)',
+  expired:'var(--mut)', flagged:'var(--err)', pending_review:'var(--amb)'
+}[s] || 'var(--mut)');
+
+export default function Dashboard() {
+  const { user } = useAuth();
+  const nav      = useNavigate();
+  const isSeller = user?.role === 'seller';
+  const [tab,  setTab]  = useState(isSeller ? 'listings' : 'purchases');
+  const [data, setData] = useState([]);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    setLoading(true);
+    const fn = tab === 'listings' ? couponAPI.myListings : paymentAPI.history;
+    fn().then(r => setData(r.data.data)).catch(() => toast.error('Failed to load data')).finally(() => setLoading(false));
+  }, [tab]);
+
+  const removeCoupon = async (id) => {
+    if (!window.confirm('Remove this coupon listing?')) return;
+    try { await couponAPI.remove(id); setData(d => d.filter(c => c._id !== id)); toast.success('Removed'); }
+    catch (e) { toast.error(e.response?.data?.message || 'Failed to remove'); }
+  };
+
+  return (
+    <div className="page">
+      <div className="container" style={{ paddingTop:'2rem', paddingBottom:'4rem' }}>
+
+        {/* Header */}
+        <div style={{ marginBottom:'2rem' }}>
+          <h1 style={{ fontSize:'2rem', marginBottom:'.4rem' }}>Dashboard</h1>
+          <p style={{ color:'var(--mut)' }}>Welcome back, <strong>{user?.name}</strong> · {user?.role}</p>
+        </div>
+
+        {/* Stats row */}
+        <div className="g2" style={{ gridTemplateColumns:'repeat(auto-fit,minmax(160px,1fr))', marginBottom:'2rem' }}>
+          {[
+            { l:'Trust Score',   v:`${user?.trustScore}/100`, c:'var(--acc)' },
+            { l:'Total Txns',    v: user?.totalTransactions,  c:'var(--txt)' },
+            { l:'Success Rate',  v:`${user?.successRate ?? 100}%`, c:'var(--acc)' },
+            { l:'Wallet',        v:`₹${user?.wallet?.balance ?? 0}`, c:'var(--amb)' },
+          ].map(({ l, v, c }) => (
+            <div key={l} className="card" style={{ textAlign:'center' }}>
+              <div style={{ fontFamily:'Syne,sans-serif', fontSize:'1.6rem', fontWeight:800, color:c }}>{v}</div>
+              <div style={{ color:'var(--mut)', fontSize:'.78rem', marginTop:'.2rem' }}>{l}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Tabs */}
+        <div style={{ display:'flex', gap:'.5rem', marginBottom:'1.5rem' }}>
+          {[
+            ...(isSeller ? [{ k:'listings', l:'My Listings' }] : []),
+            { k:'purchases', l:'My Purchases' },
+          ].map(t => (
+            <button key={t.k} className="btn btn-sm"
+              onClick={() => setTab(t.k)}
+              style={{
+                background: tab === t.k ? 'var(--acc)' : 'transparent',
+                color:      tab === t.k ? '#000' : 'var(--mut)',
+                border:    `1px solid ${tab === t.k ? 'transparent' : 'var(--bdr)'}`,
+              }}>{t.l}</button>
+          ))}
+          {isSeller && (
+            <button className="btn btn-sm btn-primary" style={{ marginLeft:'auto' }} onClick={() => nav('/sell')}>
+              + New Listing
+            </button>
+          )}
+        </div>
+
+        {/* Content */}
+        {loading ? (
+          <div style={{ display:'flex', flexDirection:'column', gap:'1rem' }}>
+            {[...Array(3)].map((_,i) => <div key={i} className="skel" style={{ height:80 }}/>)}
+          </div>
+        ) : data.length === 0 ? (
+          <div style={{ textAlign:'center', padding:'4rem', color:'var(--mut)' }}>
+            <div style={{ fontSize:'3rem', marginBottom:'1rem' }}>
+              {tab === 'listings' ? '🏪' : '🛒'}
+            </div>
+            <p>{tab === 'listings' ? 'No listings yet.' : 'No purchases yet.'}</p>
+            <button className="btn btn-primary" style={{ marginTop:'1rem' }}
+              onClick={() => nav(tab === 'listings' ? '/sell' : '/marketplace')}>
+              {tab === 'listings' ? 'List a Coupon' : 'Browse Marketplace'}
+            </button>
+          </div>
+        ) : (
+          <div style={{ display:'flex', flexDirection:'column', gap:'.85rem' }}>
+            {tab === 'listings' ? (
+              data.map(c => (
+                <div key={c._id} className="card" style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'1rem', padding:'1rem 1.3rem' }}>
+                  <div>
+                    <div style={{ fontWeight:700, marginBottom:'.25rem' }}>{c.brand}</div>
+                    <div style={{ fontSize:'.8rem', color:'var(--mut)' }}>{c.description}</div>
+                    <div style={{ fontSize:'.75rem', marginTop:'.3rem' }}>
+                      <code style={{ color:'var(--txt)' }}>{c.maskedCode}</code>
+                      <span style={{ margin:'0 .5rem', color:'var(--bdr)' }}>·</span>
+                      <span style={{ color:'var(--acc)' }}>₹{c.salePrice}</span>
+                      <span style={{ margin:'0 .5rem', color:'var(--bdr)' }}>·</span>
+                      <span>AI Score: {c.ai?.score ?? '—'}</span>
+                    </div>
+                  </div>
+                  <div style={{ display:'flex', alignItems:'center', gap:'1rem' }}>
+                    <span style={{
+                      background: `${couponStatusColor(c.status)}22`,
+                      color: couponStatusColor(c.status),
+                      border: `1px solid ${couponStatusColor(c.status)}44`,
+                      padding:'.25rem .65rem', borderRadius:100, fontSize:'.72rem', fontWeight:600, textTransform:'capitalize'
+                    }}>{c.status.replace(/_/g,' ')}</span>
+                    <span style={{ fontSize:'.78rem', color:'var(--mut)' }}>
+                      {Math.ceil((new Date(c.expiryDate) - Date.now()) / 86400000)}d left
+                    </span>
+                    {!['sold','reserved'].includes(c.status) && (
+                      <button className="btn btn-sm btn-danger" onClick={() => removeCoupon(c._id)}>Remove</button>
+                    )}
+                  </div>
+                </div>
+              ))
+            ) : (
+              data.map(t => (
+                <div key={t._id} className="card" style={{ display:'flex', justifyContent:'space-between', alignItems:'center', flexWrap:'wrap', gap:'1rem', padding:'1rem 1.3rem' }}>
+                  <div>
+                    <div style={{ fontWeight:700, marginBottom:'.25rem' }}>{t.coupon?.brand || 'Coupon'}</div>
+                    <div style={{ fontSize:'.8rem', color:'var(--mut)' }}>{t.coupon?.description}</div>
+                    <div style={{ fontSize:'.75rem', color:'var(--mut)', marginTop:'.3rem' }}>
+                      {new Date(t.createdAt).toLocaleDateString('en-IN')} · Escrow: {(t.escrow?.status || '').replace(/_/g,' ')}
+                    </div>
+                  </div>
+                  <div style={{ display:'flex', alignItems:'center', gap:'1rem' }}>
+                    <span style={{
+                      background: `${statusColor(t.status)}22`,
+                      color: statusColor(t.status),
+                      border: `1px solid ${statusColor(t.status)}44`,
+                      padding:'.25rem .65rem', borderRadius:100, fontSize:'.72rem', fontWeight:600, textTransform:'capitalize'
+                    }}>{t.status.replace(/_/g,' ')}</span>
+                    <span style={{ fontFamily:'Syne,sans-serif', fontWeight:800, color:'var(--acc)' }}>₹{t.amount}</span>
+                    {['in_escrow','payment_pending'].includes(t.status) && (
+                      <button className="btn btn-sm btn-purple" onClick={() => nav(`/payment/processing?txn=${t.txnId}`)}>
+                        View →
+                      </button>
+                    )}
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+import React, { useState } from 'react';
+import { Link, useNavigate, useSearchParams } from 'react-router-dom';
+import { useAuth } from '../context/AuthContext';
+import toast from 'react-hot-toast';
+
+export default function Register() {
+  const { register } = useAuth();
+  const nav = useNavigate();
+  const [params] = useSearchParams();
+  const [form, setForm] = useState({ name:'', email:'', password:'', phone:'', role: params.get('role') || 'buyer' });
+  const [err,  setErr]  = useState('');
+  const [busy, setBusy] = useState(false);
+
+  const set = k => e => setForm(f => ({ ...f, [k]: e.target.value }));
+
+  const submit = async e => {
+    e.preventDefault(); setErr(''); setBusy(true);
+    if (!/(?=.*[a-z])(?=.*[A-Z])(?=.*\d)/.test(form.password)) {
+      setErr('Password must have uppercase, lowercase, and a number'); setBusy(false); return;
+    }
+    try {
+      const u = await register(form);
+      toast.success(`Account created! Welcome, ${u.name.split(' ')[0]}!`);
+      nav(u.role === 'seller' ? '/sell' : '/marketplace');
+    } catch (e) {
+      setErr(e.response?.data?.message || e.response?.data?.errors?.[0]?.msg || 'Registration failed.');
+    } finally { setBusy(false); }
+  };
+
+  return (
+    <div className="page" style={{ display:'flex',alignItems:'center',justifyContent:'center',padding:'2rem' }}>
+      <div style={{ width:'100%',maxWidth:460 }}>
+        <div style={{ textAlign:'center',marginBottom:'2rem' }}>
+          <h1 style={{ fontSize:'2rem',marginBottom:'.4rem' }}>Create Account</h1>
+          <p style={{ color:'var(--mut)' }}>Join the smartest coupon marketplace</p>
+        </div>
+
+        <form onSubmit={submit} className="card">
+          {err && <div style={{ background:'rgba(239,68,68,.1)',border:'1px solid rgba(239,68,68,.25)',
+            color:'var(--err)',padding:'.7rem 1rem',borderRadius:10,marginBottom:'1rem',fontSize:'.85rem' }}>{err}</div>}
+
+          {/* Role selector */}
+          <div style={{ display:'flex',gap:'.6rem',marginBottom:'1.2rem' }}>
+            {['buyer','seller'].map(r => (
+              <button key={r} type="button"
+                onClick={() => setForm(f => ({ ...f, role: r }))}
+                className="btn"
+                style={{ flex:1,justifyContent:'center',
+                  background: form.role === r ? (r === 'buyer' ? 'var(--pur)' : 'var(--acc)') : 'transparent',
+                  color: form.role === r ? (r === 'buyer' ? '#fff' : '#000') : 'var(--mut)',
+                  border:`1px solid ${form.role === r ? 'transparent' : 'var(--bdr)'}` }}>
+                {r === 'buyer' ? '🛒 I want to Buy' : '🏪 I want to Sell'}
+              </button>
+            ))}
+          </div>
+
+          <div className="f2">
+            <div className="fg">
+              <label className="fl">Full Name</label>
+              <input className="fi" placeholder="Rahul Sharma" value={form.name} onChange={set('name')} required/>
+            </div>
+            <div className="fg">
+              <label className="fl">Phone</label>
+              <input className="fi" type="tel" placeholder="9876543210" value={form.phone} onChange={set('phone')}/>
+            </div>
+          </div>
+          <div className="fg">
+            <label className="fl">Email</label>
+            <input className="fi" type="email" placeholder="you@example.com" value={form.email} onChange={set('email')} required/>
+          </div>
+          <div className="fg">
+            <label className="fl">Password</label>
+            <input className="fi" type="password" placeholder="Min 8 chars, upper + lower + number" value={form.password} onChange={set('password')} required minLength={8}/>
+          </div>
+
+          <button className="btn btn-primary btn-full" type="submit" disabled={busy} style={{ marginTop:'.5rem' }}>
+            {busy ? 'Creating account...' : `Create ${form.role === 'seller' ? 'Seller' : 'Buyer'} Account →`}
+          </button>
+
+          <p style={{ textAlign:'center',marginTop:'1.2rem',fontSize:'.85rem',color:'var(--mut)' }}>
+            Already have an account? <Link to="/login" style={{ color:'var(--acc)' }}>Sign in</Link>
+          </p>
+        </form>
+      </div>
+    </div>
+  );
+}
+
+import React, { createContext, useContext, useState, useEffect } from 'react';
+import { authAPI } from '../services/api';
+
+const Ctx = createContext(null);
+
+export const AuthProvider = ({ children }) => {
+  const [user, setUser]       = useState(null);
+  const [loading, setLoading] = useState(true);
+
+  useEffect(() => {
+    const t = localStorage.getItem('cx_token');
+    if (t) {
+      authAPI.me().then(r => setUser(r.data.user)).catch(() => localStorage.clear()).finally(() => setLoading(false));
+    } else setLoading(false);
+  }, []);
+
+  const login = async (email, password) => {
+    const { data } = await authAPI.login({ email, password });
+    localStorage.setItem('cx_token', data.accessToken);
+    localStorage.setItem('cx_refresh', data.refreshToken);
+    setUser(data.user);
+    return data.user;
+  };
+
+  const register = async (form) => {
+    const { data } = await authAPI.register(form);
+    localStorage.setItem('cx_token', data.accessToken);
+    localStorage.setItem('cx_refresh', data.refreshToken);
+    setUser(data.user);
+    return data.user;
+  };
+
+  const logout = async () => {
+    try { await authAPI.logout(); } catch {}
+    localStorage.clear();
+    setUser(null);
+  };
+
+  return <Ctx.Provider value={{ user, loading, login, register, logout }}>{children}</Ctx.Provider>;
+};
+
+export const useAuth = () => useContext(Ctx);
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8"/>
+  <meta name="viewport" content="width=device-width, initial-scale=1"/>
+  <meta name="theme-color" content="#080c14"/>
+  <meta name="description" content="CouponX — AI-Powered Secure Coupon Marketplace"/>
+  <title>CouponX</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link href="https://fonts.googleapis.com/css2?family=Syne:wght@700;800&family=DM+Sans:wght@400;500;600&display=swap" rel="stylesheet">
+</head>
+<body>
+  <noscript>CouponX requires JavaScript.</noscript>
+  <div id="root"></div>
+</body>
+</html>
+
+FROM node:20-alpine AS build
+WORKDIR /app
+ARG REACT_APP_API_URL
+ENV REACT_APP_API_URL=$REACT_APP_API_URL
+COPY package*.json ./
+RUN npm install
+COPY . .
+RUN npm run build
+
+FROM nginx:alpine
+COPY --from=build /app/build /usr/share/nginx/html
+COPY nginx.conf /etc/nginx/conf.d/default.conf
+EXPOSE 80
+CMD ["nginx", "-g", "daemon off;"]
+
+{
+  "name": "couponx-frontend",
+  "version": "1.0.0",
+  "private": true,
+  "dependencies": {
+    "react": "^18.2.0",
+    "react-dom": "^18.2.0",
+    "react-router-dom": "^6.20.1",
+    "axios": "^1.6.2",
+    "react-hot-toast": "^2.4.1"
+  },
+  "scripts": {
+    "dev": "react-scripts start",
+    "start": "react-scripts start",
+    "build": "react-scripts build"
+  },
+  "proxy": "http://localhost:5000",
+  "browserslist": { "production": [">0.2%","not dead"], "development": ["last 1 chrome version"] },
+  "devDependencies": { "react-scripts": "5.0.1" }
+}
+
+server {
+    listen 80;
+    root /usr/share/nginx/html;
+    index index.html;
+
+    location / {
+        try_files $uri $uri/ /index.html;
+    }
+
+    location /api {
+        proxy_pass http://backend:5000;
+        proxy_set_header Host $host;
+        proxy_set_header X-Real-IP $remote_addr;
+    }
+
+    gzip on;
+    gzip_types text/plain application/javascript text/css application/json;
+}
+
+REACT_APP_API_URL=http://localhost:5000/api
