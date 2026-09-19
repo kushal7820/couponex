@@ -1,0 +1,55 @@
+version: '3.8'
+
+services:
+  mongo:
+    image: mongo:7
+    container_name: couponx_mongo
+    restart: unless-stopped
+    volumes:
+      - mongo_data:/data/db
+    ports:
+      - "27017:27017"
+    environment:
+      MONGO_INITDB_DATABASE: couponx
+
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: couponx_backend
+    restart: unless-stopped
+    depends_on:
+      - mongo
+    ports:
+      - "5000:5000"
+    environment:
+      NODE_ENV: production
+      PORT: 5000
+      MONGODB_URI: mongodb://mongo:27017/couponx
+      JWT_SECRET: ${JWT_SECRET}
+      JWT_REFRESH_SECRET: ${JWT_REFRESH_SECRET}
+      JUSPAY_MERCHANT_ID: ${JUSPAY_MERCHANT_ID}
+      JUSPAY_API_KEY: ${JUSPAY_API_KEY}
+      JUSPAY_BASE_URL: ${JUSPAY_BASE_URL:-https://sandbox.juspay.in}
+      JUSPAY_WEBHOOK_SECRET: ${JUSPAY_WEBHOOK_SECRET}
+      COUPON_ENCRYPTION_KEY: ${COUPON_ENCRYPTION_KEY}
+      ANTHROPIC_API_KEY: ${ANTHROPIC_API_KEY}
+      FRONTEND_URL: ${FRONTEND_URL:-http://localhost:3000}
+    volumes:
+      - ./backend/logs:/app/logs
+
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+      args:
+        REACT_APP_API_URL: ${REACT_APP_API_URL:-http://localhost:5000/api}
+    container_name: couponx_frontend
+    restart: unless-stopped
+    depends_on:
+      - backend
+    ports:
+      - "3000:80"
+
+volumes:
+  mongo_data:
